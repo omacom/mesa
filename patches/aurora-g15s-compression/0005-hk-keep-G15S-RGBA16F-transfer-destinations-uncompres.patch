@@ -1,0 +1,25 @@
+From abacab8517f9632b0ff5fcf9ab2801f150dacc19 Mon Sep 17 00:00:00 2001
+From: Chris Kearney <303316+iconidentify@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 11:10:43 -0700
+Subject: [PATCH 5/6] hk: keep G15S RGBA16F transfer destinations uncompressed
+
+Restrict the RGBA16F compression option to attachments without transfer-destination usage. Raw buffer uploads retain their uncompressed allocation and upload path; color-rendered input attachments remain eligible.
+
+Signed-off-by: Chris Kearney <303316+iconidentify@users.noreply.github.com>
+---
+ src/asahi/vulkan/hk_image.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/asahi/vulkan/hk_image.c b/src/asahi/vulkan/hk_image.c
+index 4afeb4b42e09906e9f56e35ff2a15d67e1758a86..7efeeeb64a91301e9d7db7af54f0cce2b8f5c9b9 100644
+--- a/src/asahi/vulkan/hk_image.c
++++ b/src/asahi/vulkan/hk_image.c
+@@ -333,6 +333,8 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
+       samples == 1 && plane == 0 &&
+       format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+       (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
++      /* Raw buffer uploads require an uncompressed destination. */
++      !(usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
+       !(flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT);
+    const struct vk_format_ycbcr_info *ycbcr_info =
+       vk_format_get_ycbcr_info(format);

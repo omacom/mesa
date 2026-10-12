@@ -1,0 +1,350 @@
+From f6cd15739708847f29d7413eedfa3f47ee4f907d Mon Sep 17 00:00:00 2001
+From: Chris Kearney <303316+iconidentify@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 01:39:21 -0700
+Subject: [PATCH 1/6] hk: honor explicit DRM modifier plane offsets
+
+Keep each explicit plane offset relative to the image memory binding. Include layout gaps in memory requirements and report the same offsets in subresource layouts. Validate plane count, linear pitch, alignment and size overflow before admitting the layout.
+
+Exercise R8, R8G8 and NV12 plane binding, nonzero bind bases, layout queries, malformed layouts and ordinary packing through the production image implementation.
+
+Signed-off-by: Chris Kearney <303316+iconidentify@users.noreply.github.com>
+---
+ src/asahi/vulkan/hk_image.c                   |  55 ++++--
+ src/asahi/vulkan/hk_image.h                   |   2 +
+ src/asahi/vulkan/meson.build                  |  15 ++
+ .../tests/test-hk-explicit-plane-layout.c     | 169 ++++++++++++++++++
+ 4 files changed, 230 insertions(+), 11 deletions(-)
+ create mode 100644 src/asahi/vulkan/tests/test-hk-explicit-plane-layout.c
+
+diff --git a/src/asahi/vulkan/hk_image.c b/src/asahi/vulkan/hk_image.c
+index ac770ed92ec27ab08770039129db97e12535f8f7..e94219884d87a7d06817f8289f1c94cc9f49e0b8 100644
+--- a/src/asahi/vulkan/hk_image.c
++++ b/src/asahi/vulkan/hk_image.c
+@@ -1035,6 +1035,9 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
+       uint64_t modifier = DRM_FORMAT_MOD_INVALID;
+ 
+       if (mod_explicit_info) {
++         if (mod_explicit_info->drmFormatModifierPlaneCount != image->plane_count)
++            return vk_error(dev,
++                            VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
+          modifier = mod_explicit_info->drmFormatModifier;
+       } else {
+          const struct VkImageDrmFormatModifierListCreateInfoEXT *mod_list_info =
+@@ -1067,8 +1070,12 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
+ 
+       uint32_t linear_stride_B = 0;
+       if (mod_explicit_info &&
+-          image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR)
++          image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR) {
++         if (mod_explicit_info->pPlaneLayouts[plane].rowPitch > UINT32_MAX)
++            return vk_error(dev,
++                            VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
+          linear_stride_B = mod_explicit_info->pPlaneLayouts[plane].rowPitch;
++      }
+ 
+       bool compressed =
+          hk_map_compression(dev, pCreateInfo, plane, image->vk.drm_format_mod);
+@@ -1102,7 +1109,26 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
+          .renderable = true,
+       };
+ 
++      if (mod_explicit_info &&
++          image->vk.drm_format_mod == DRM_FORMAT_MOD_LINEAR &&
++          (linear_stride_B % 16 ||
++           linear_stride_B < util_format_get_stride(
++                                image->planes[plane].layout.format,
++                                image->planes[plane].layout.width_px)))
++         return vk_error(dev,
++                         VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
++
+       ail_make_miptree(&image->planes[plane].layout);
++
++      if (mod_explicit_info) {
++         uint64_t offset_B = mod_explicit_info->pPlaneLayouts[plane].offset;
++         if (offset_B % HK_PLANE_ALIGN_B ||
++             offset_B > UINT64_MAX - image->planes[plane].layout.size_B)
++            return vk_error(dev,
++                            VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
++         image->planes[plane].explicit_layout = true;
++         image->planes[plane].layout_offset_B = offset_B;
++      }
+    }
+ 
+    return VK_SUCCESS;
+@@ -1238,8 +1264,12 @@ hk_image_plane_add_req(struct hk_image_plane *plane, bool sparse,
+    assert(util_is_power_of_two_or_zero64(plane_align_B));
+ 
+    *align_B = MAX2(*align_B, plane_align_B);
+-   *size_B = align64(*size_B, plane_align_B);
+-   *size_B += plane->layout.size_B;
++   if (plane->explicit_layout) {
++      *size_B = MAX2(*size_B, plane->layout_offset_B + plane->layout.size_B);
++   } else {
++      *size_B = align64(*size_B, plane_align_B);
++      *size_B += plane->layout.size_B;
++   }
+ }
+ 
+ static void
+@@ -1447,8 +1477,8 @@ hk_get_image_subresource_layout(UNUSED struct hk_device *dev,
+    const uint8_t p = hk_image_aspects_to_plane(image, isr->aspectMask);
+    const struct hk_image_plane *plane = &image->planes[p];
+ 
+-   uint64_t offset_B = 0;
+-   if (!image->disjoint) {
++   uint64_t offset_B = plane->layout_offset_B;
++   if (!plane->explicit_layout && !image->disjoint) {
+       uint32_t align_B = 0;
+       /* TODO: sparse? */
+       for (unsigned plane = 0; plane < p; plane++)
+@@ -1519,7 +1549,9 @@ static void
+ hk_image_plane_bind(struct hk_device *dev, struct hk_image_plane *plane,
+                     struct hk_device_memory *mem, uint64_t *offset_B)
+ {
+-   *offset_B = align64(*offset_B, HK_PLANE_ALIGN_B);
++   uint64_t binding_offset_B = plane->explicit_layout
++                                 ? *offset_B + plane->layout_offset_B
++                                 : align64(*offset_B, HK_PLANE_ALIGN_B);
+ 
+    if (plane->va) {
+ #if 0
+@@ -1527,19 +1559,20 @@ hk_image_plane_bind(struct hk_device *dev, struct hk_image_plane *plane,
+                              mem->bo,
+                              plane->addr,
+                              plane->va,
+-                             *offset_B,
++                             binding_offset_B,
+                              plane->nil.pte_kind);
+ #endif
+       UNREACHABLE("todo");
+    } else {
+-      plane->addr = mem->bo->va->addr + *offset_B;
+-      plane->map = agx_bo_map(mem->bo) + *offset_B;
+-      plane->rem = mem->bo->size - (*offset_B);
++      plane->addr = mem->bo->va->addr + binding_offset_B;
++      plane->map = agx_bo_map(mem->bo) + binding_offset_B;
++      plane->rem = mem->bo->size - binding_offset_B;
+       plane->private_binding =
+          !(mem->bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE));
+    }
+ 
+-   *offset_B += plane->layout.size_B;
++   if (!plane->explicit_layout)
++      *offset_B = binding_offset_B + plane->layout.size_B;
+ }
+ 
+ VKAPI_ATTR VkResult VKAPI_CALL
+diff --git a/src/asahi/vulkan/hk_image.h b/src/asahi/vulkan/hk_image.h
+index 8ad41943e57eb68b838e251c27583b515954657f..4f34a74061f2cb7b72c72f7ade7fd799842c7d94 100644
+--- a/src/asahi/vulkan/hk_image.h
++++ b/src/asahi/vulkan/hk_image.h
+@@ -51,6 +51,8 @@ hk_get_image_format_features(struct hk_physical_device *pdevice,
+ 
+ struct hk_image_plane {
+    struct ail_layout layout;
++   bool explicit_layout;
++   uint64_t layout_offset_B;
+    uint64_t addr;
+    struct agx_va *va;
+ 
+diff --git a/src/asahi/vulkan/meson.build b/src/asahi/vulkan/meson.build
+index 3d00a72ec852dda1119e620a945377a657386e9b..9cc8cb91c4a3fc75dd1a13325700fa519e17137c 100644
+--- a/src/asahi/vulkan/meson.build
++++ b/src/asahi/vulkan/meson.build
+@@ -1116,6 +1116,21 @@ libvulkan_asahi = shared_library(
+   install : true,
+ )
+ 
++if with_tests
++  test('hk_explicit_plane_layout',
++    executable('hk-explicit-plane-layout',
++      files('tests/test-hk-explicit-plane-layout.c'),
++      include_directories : [inc_gallium, inc_gallium_aux, inc_include,
++                             inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
++      dependencies : [hk_deps],
++      link_with : [libhk, libasahi_lib, libasahi_layout, libasahi_compiler],
++      c_args : ['-Wno-c2x-extensions', '-ffunction-sections', '-fdata-sections'],
++      link_args : ['-Wl,--gc-sections'],
++    ),
++    suite : ['asahi'],
++  )
++endif
++
+ icd_file_name = libname_prefix + 'vulkan_asahi.' + libname_suffix
+ 
+ asahi_icd = custom_target(
+diff --git a/src/asahi/vulkan/tests/test-hk-explicit-plane-layout.c b/src/asahi/vulkan/tests/test-hk-explicit-plane-layout.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..118f96f30e1241d01875fd49e47c8302c3ae899c
+--- /dev/null
++++ b/src/asahi/vulkan/tests/test-hk-explicit-plane-layout.c
+@@ -0,0 +1,169 @@
++/* SPDX-License-Identifier: MIT */
++#include "../hk_image.c"
++#include "vk_instance.h"
++
++static struct hk_device dev;
++static struct hk_physical_device pdev;
++static struct vk_instance instance;
++static unsigned char pixels[131072];
++
++static VkResult
++make_image(struct hk_image *image, VkFormat format, bool disjoint,
++           unsigned plane_count, VkSubresourceLayout *planes)
++{
++   *image = (struct hk_image){0};
++   VkImageDrmFormatModifierExplicitCreateInfoEXT modifier = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
++      .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
++      .drmFormatModifierPlaneCount = plane_count,
++      .pPlaneLayouts = planes,
++   };
++   VkImageCreateInfo info = {
++      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
++      .pNext = planes ? &modifier : NULL,
++      .flags = disjoint ? VK_IMAGE_CREATE_DISJOINT_BIT : 0,
++      .imageType = VK_IMAGE_TYPE_2D,
++      .format = format,
++      .extent = {64, 32, 1},
++      .mipLevels = 1,
++      .arrayLayers = 1,
++      .samples = VK_SAMPLE_COUNT_1_BIT,
++      .tiling = planes ? VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
++                       : VK_IMAGE_TILING_LINEAR,
++      .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
++   };
++   return hk_image_init(&dev, image, &info);
++}
++
++static void
++finish_image(struct hk_image *image)
++{
++   vk_object_base_finish(&image->vk.base);
++}
++
++static void
++check_plane(struct hk_image *image, unsigned p, uint64_t bind_base,
++            uint64_t expected_offset, unsigned char expected_byte)
++{
++   struct agx_va va = {.addr = 0x100000};
++   struct agx_bo bo = {
++      .va = &va, .size = sizeof(pixels), ._map = pixels,
++      .flags = AGX_BO_SHARED,
++   };
++   struct hk_device_memory memory = {.bo = &bo};
++   struct hk_image_plane *plane = &image->planes[p];
++   uint64_t offset = bind_base;
++   hk_image_plane_bind(&dev, plane, &memory, &offset);
++   uint64_t bound = bind_base +
++      (image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
++         ? expected_offset : 0);
++   assert(plane->addr == va.addr + bound);
++   assert(plane->map == pixels + bound);
++   assert(plane->rem == sizeof(pixels) - bound);
++   assert(!plane->private_binding);
++   assert(*(unsigned char *)plane->map == expected_byte);
++   if (plane->explicit_layout)
++      assert(offset == bind_base);
++
++   VkImageSubresource2KHR subresource = {
++      .imageSubresource = {
++         .aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT << p,
++      },
++   };
++   VkSubresourceLayout2KHR layout = {0};
++   hk_get_image_subresource_layout(&dev, image, &subresource, &layout);
++   assert(layout.subresourceLayout.offset == expected_offset);
++   assert(layout.subresourceLayout.rowPitch == plane->layout.linear_stride_B);
++   assert(layout.subresourceLayout.size == plane->layout.size_B);
++}
++
++static void
++check_explicit(VkFormat format, bool disjoint, unsigned count,
++               uint64_t offset0, uint64_t offset1)
++{
++   VkSubresourceLayout layouts[2] = {
++      {.offset = offset0, .rowPitch = 128},
++      {.offset = offset1, .rowPitch = 128},
++   };
++   struct hk_image image;
++   assert(make_image(&image, format, disjoint, count, layouts) == VK_SUCCESS);
++   memset(pixels, 0x40, sizeof(pixels));
++   uint64_t max_end = 0;
++   for (unsigned p = 0; p < count; p++) {
++      uint64_t off = layouts[p].offset;
++      memset(pixels + 4096 + off, 0xc0 + p, image.planes[p].layout.size_B);
++      check_plane(&image, p, 4096, off, 0xc0 + p);
++      max_end = MAX2(max_end, off + image.planes[p].layout.size_B);
++   }
++   VkMemoryRequirements2 reqs = {0};
++   if (!disjoint) {
++      hk_get_image_memory_requirements(&dev, &image, image.vk.aspects, &reqs);
++      assert(reqs.memoryRequirements.size == max_end);
++      assert(reqs.memoryRequirements.alignment == HK_PLANE_ALIGN_B);
++   } else {
++      for (unsigned p = 0; p < count; p++) {
++         hk_get_image_memory_requirements(&dev, &image,
++            VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT << p, &reqs);
++         assert(reqs.memoryRequirements.size ==
++                layouts[p].offset + image.planes[p].layout.size_B);
++      }
++   }
++   finish_image(&image);
++}
++
++static void
++check_invalid(unsigned count, uint64_t offset, uint64_t stride)
++{
++   VkSubresourceLayout layouts[2] = {
++      {.offset = offset, .rowPitch = stride},
++      {.offset = 32768, .rowPitch = 128},
++   };
++   struct hk_image image;
++   assert(make_image(&image, VK_FORMAT_R8_UNORM, false, count, layouts) ==
++          VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
++   finish_image(&image);
++}
++
++static void
++check_ordinary(void)
++{
++   struct hk_image image;
++   assert(make_image(&image, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
++                     false, 2, NULL) == VK_SUCCESS);
++   uint64_t size = 0;
++   uint32_t align = 0;
++   hk_image_plane_add_req(&image.planes[0], false, &size, &align);
++   uint64_t plane1 = align64(size, HK_PLANE_ALIGN_B);
++   hk_image_plane_add_req(&image.planes[1], false, &size, &align);
++   assert(size == plane1 + image.planes[1].layout.size_B);
++   memset(pixels, 0x40, sizeof(pixels));
++   check_plane(&image, 0, 0, 0, 0x40);
++   check_plane(&image, 1, plane1, plane1, 0x40);
++   finish_image(&image);
++}
++
++int main(void)
++{
++   dev.dev.chip = AGX_CHIP_G15S;
++   dev.vk.physical = &pdev.vk;
++   dev.vk.base.type = VK_OBJECT_TYPE_DEVICE;
++   dev.vk.base.device = &dev.vk;
++   pdev.vk.instance = &instance;
++   list_inithead(&instance.debug_utils.callbacks);
++   list_inithead(&instance.debug_report.callbacks);
++   pdev.mem_type_count = 1;
++   check_explicit(VK_FORMAT_R8_UNORM, false, 1, 32768, 0);
++   check_explicit(VK_FORMAT_R8G8_UNORM, false, 1, 32768, 0);
++   check_explicit(VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, false, 2, 0, 32768);
++   check_explicit(VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, false, 2, 32768, 0);
++   check_explicit(VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, true, 2, 0, 32768);
++   check_invalid(2, 0, 128);
++   check_invalid(1, 1, 128);
++   check_invalid(1, UINT64_MAX - 127, 128);
++   check_invalid(1, 0, (uint64_t)UINT32_MAX + 1);
++   check_invalid(1, 0, 65);
++   check_invalid(1, 0, 16);
++   check_ordinary();
++   puts("explicit plane layout controls passed");
++   return 0;
++}

@@ -1,0 +1,38 @@
+{
+  "base": "3d7a02dc8d29ab0c23d63d066f1b8f03aa5838b6",
+  "base_tree": "55e69f793dfb9649c133f699b81d4452dddcfbc9",
+  "tested_source": "3c74c2b3130f31cfdf57455097c96966a2487eee",
+  "expected_tree": "3362757e137e676638596fc540c8bd3045926ad3",
+  "patches": [
+    {
+      "file": "0001-hk-honor-explicit-DRM-modifier-plane-offsets.patch",
+      "commit": "f6cd15739708847f29d7413eedfa3f47ee4f907d",
+      "sha256": "db8da343bcd9fb42de01ec54c3a2d597c9db6807151bcbafe3170b195c66b191"
+    },
+    {
+      "file": "0002-hk-expose-the-plane-layout-control-to-package-builde.patch",
+      "commit": "7ff89a4da387bd561b78efd5f09c98ca8ae18538",
+      "sha256": "e5817b28156c24ceb18a7ba6150cea0fff139354c37df069e89f5f1d573a9b16"
+    },
+    {
+      "file": "0003-hk-add-opt-in-G15S-split-depth-compression.patch",
+      "commit": "64560b671b656e1f34556e71dc1bd320df6081cd",
+      "sha256": "5df1821cb1d53bc4a3aca296608acac44aaf79a39629350003ce53387de61400"
+    },
+    {
+      "file": "0004-hk-isolate-legacy-G15S-single-sample-RGBA16F-compres.patch",
+      "commit": "9d46798629e64d514e5a110aae3ebeb103914d83",
+      "sha256": "0d1ee19f458bd93f74afe0e028e3de12d2d7fcf3448ade8a44f166cb37b585fb"
+    },
+    {
+      "file": "0005-hk-keep-G15S-RGBA16F-transfer-destinations-uncompres.patch",
+      "commit": "abacab8517f9632b0ff5fcf9ab2801f150dacc19",
+      "sha256": "2a9d23f8931ac73458642794cc4243b6205def23070f210f4c38e1b8663f3506"
+    },
+    {
+      "file": "0006-hk-add-opt-in-G15S-R8-color-attachment-compression.patch",
+      "commit": "3c74c2b3130f31cfdf57455097c96966a2487eee",
+      "sha256": "a873aa501b5acb3ae71f4ee443da4d19e96aedef23582df9db6f856b8fb68fff"
+    }
+  ]
+}

@@ -1,0 +1,211 @@
+From 64560b671b656e1f34556e71dc1bd320df6081cd Mon Sep 17 00:00:00 2001
+From: Chris Kearney <303316+iconidentify@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 03:23:28 -0700
+Subject: [PATCH 3/6] hk: add opt-in G15S split depth compression
+
+Compress only the depth plane of single-sample D32_SFLOAT_S8_UINT
+images on legacy G15S. Keep stencil uncompressed and preserve other
+profiles. Limit the path to optimal 2D images with one layer and level.
+Keep the default uncompressed and expose allocation and submit fields
+through an optional trace.
+
+Signed-off-by: Chris Kearney <303316+iconidentify@users.noreply.github.com>
+---
+ src/asahi/vulkan/hk_g15s_split_depth.h        | 25 ++++++++++
+ src/asahi/vulkan/hk_image.c                   | 22 ++++++++-
+ src/asahi/vulkan/hk_queue.c                   | 11 +++++
+ src/asahi/vulkan/meson.build                  | 12 +++++
+ .../vulkan/tests/test-hk-g15s-split-depth.c   | 46 +++++++++++++++++++
+ 5 files changed, 115 insertions(+), 1 deletion(-)
+ create mode 100644 src/asahi/vulkan/hk_g15s_split_depth.h
+ create mode 100644 src/asahi/vulkan/tests/test-hk-g15s-split-depth.c
+
+diff --git a/src/asahi/vulkan/hk_g15s_split_depth.h b/src/asahi/vulkan/hk_g15s_split_depth.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5025a8e07abf621cc3d8809ef19275e2995b60eb
+--- /dev/null
++++ b/src/asahi/vulkan/hk_g15s_split_depth.h
+@@ -0,0 +1,25 @@
++/* SPDX-License-Identifier: MIT */
++#pragma once
++
++#include <stdbool.h>
++#include <vulkan/vulkan_core.h>
++#include "asahi/lib/agx_chip.h"
++
++static inline bool
++hk_g15s_split_depth_plane(enum agx_chip chip, unsigned hal, VkFormat format,
++                         unsigned plane, unsigned samples, bool enabled)
++{
++   return enabled && chip == AGX_CHIP_G15S && hal == 0 && plane == 0 &&
++          samples == 1 && format == VK_FORMAT_D32_SFLOAT_S8_UINT;
++}
++
++static inline bool
++hk_g15s_split_depth_shape(const VkImageCreateInfo *info)
++{
++   return info->imageType == VK_IMAGE_TYPE_2D &&
++          info->tiling == VK_IMAGE_TILING_OPTIMAL && info->mipLevels == 1 &&
++          info->arrayLayers == 1 && info->extent.depth == 1 && info->flags == 0 &&
++          !(info->usage & (VK_IMAGE_USAGE_STORAGE_BIT |
++                           VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT |
++                           VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT));
++}
+diff --git a/src/asahi/vulkan/hk_image.c b/src/asahi/vulkan/hk_image.c
+index e94219884d87a7d06817f8289f1c94cc9f49e0b8..fedf9923ef17d5e6eb30cd4e6e49a9090cd0446e 100644
+--- a/src/asahi/vulkan/hk_image.c
++++ b/src/asahi/vulkan/hk_image.c
+@@ -6,6 +6,7 @@
+  */
+ #include "hk_image.h"
+ #include "hk_native_descriptor.h"
++#include "hk_g15s_split_depth.h"
+ #include "asahi/layout/layout.h"
+ #include "drm-uapi/drm_fourcc.h"
+ #include "util/bitscan.h"
+@@ -321,6 +322,9 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
+       agx_chip_uses_g15s_runtime(dev->chip) &&
+       debug_get_bool_option("HK_M3_COMPRESSED_DEPTH", false) && samples == 1 &&
+       format == VK_FORMAT_D32_SFLOAT;
++   const bool m3_split_depth_compression = hk_g15s_split_depth_plane(
++      dev->chip, dev->params.gpu_hal_generation, format, plane, samples,
++      debug_get_bool_option("HK_M3_COMPRESSED_SPLIT_DEPTH", false));
+    const struct vk_format_ycbcr_info *ycbcr_info =
+       vk_format_get_ycbcr_info(format);
+ 
+@@ -341,7 +345,7 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
+     * and metadata layout have been qualified. */
+    if (hk_descriptor_generation_is_agx3(
+           agx_chip_descriptor_generation(dev->chip)) &&
+-       !m3_depth_compression &&
++       !m3_depth_compression && !m3_split_depth_compression &&
+        !(agx_chip_uses_g15_g16_shader_abi(dev->chip) &&
+          debug_get_bool_option("HK_M4_COMPRESSED_2D", false) && samples == 1 &&
+          (format == VK_FORMAT_R8G8B8A8_UNORM ||
+@@ -881,6 +885,11 @@ static bool
+ hk_can_compress_create_info(struct hk_device *dev, unsigned plane,
+                             const VkImageCreateInfo *info)
+ {
++   if (dev->dev.chip == AGX_CHIP_G15S &&
++       info->format == VK_FORMAT_D32_SFLOAT_S8_UINT &&
++       !hk_g15s_split_depth_shape(info))
++      return false;
++
+    /* The depth upload and native ZLS bindings are qualified for one level.
+     * The separate experimental color-mipmap switch must not broaden this. */
+    if (agx_chip_uses_g15s_runtime(dev->dev.chip) &&
+@@ -1120,6 +1129,17 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
+ 
+       ail_make_miptree(&image->planes[plane].layout);
+ 
++      if (dev->dev.chip == AGX_CHIP_G15S &&
++          dev->dev.params.gpu_hal_generation == 0 &&
++          pCreateInfo->format == VK_FORMAT_D32_SFLOAT_S8_UINT &&
++          debug_get_bool_option("HK_M3_SPLIT_DEPTH_TRACE", false)) {
++         const struct ail_layout *l = &image->planes[plane].layout;
++         fprintf(stderr, "HK_SPLIT_DEPTH_ALLOC plane=%u width=%u height=%u compressed=%u size=%" PRIu64 " meta_offset=%u meta_stride=%" PRIu64 " layer_stride=%" PRIu64 "\n",
++                 plane, l->width_px, l->height_px, l->compressed, l->size_B,
++                 l->metadata_offset_B, l->compression_layer_stride_B,
++                 l->layer_stride_B);
++      }
++
+       if (mod_explicit_info) {
+          uint64_t offset_B = mod_explicit_info->pPlaneLayouts[plane].offset;
+          if (offset_B % HK_PLANE_ALIGN_B ||
+diff --git a/src/asahi/vulkan/hk_queue.c b/src/asahi/vulkan/hk_queue.c
+index b021a44d7ea055282bac72172124b40ed959caad..bca481334297ad8145b52f369c26ec61cadd0515 100644
+--- a/src/asahi/vulkan/hk_queue.c
++++ b/src/asahi/vulkan/hk_queue.c
+@@ -455,6 +455,17 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
+    c->stencil.comp_base = cs->cr.stencil.meta;
+    c->stencil.comp_stride = cs->cr.stencil.meta_stride;
+ 
++   if (dev->dev.chip == AGX_CHIP_G15S &&
++       dev->dev.params.gpu_hal_generation == 0 &&
++       debug_get_bool_option("HK_M3_SPLIT_DEPTH_TRACE", false) &&
++       (c->depth.base || c->stencil.base)) {
++      fprintf(stderr, "HK_SPLIT_DEPTH_SUBMIT width=%u height=%u zbase=%" PRIx64 " zmeta=%" PRIx64 " zstride=%u zmeta_stride=%u sbase=%" PRIx64 " smeta=%" PRIx64 " sstride=%u smeta_stride=%u zls=%" PRIx64 "\n",
++              c->width_px, c->height_px, (uint64_t)c->depth.base,
++              (uint64_t)c->depth.comp_base, c->depth.stride, c->depth.comp_stride,
++              (uint64_t)c->stencil.base, (uint64_t)c->stencil.comp_base,
++              c->stencil.stride, c->stencil.comp_stride, (uint64_t)c->zls_ctrl);
++   }
++
+    if (cs->cr.dbias_is_int == U_TRISTATE_YES) {
+       c->flags |= DRM_ASAHI_RENDER_DBIAS_IS_INT;
+    }
+diff --git a/src/asahi/vulkan/meson.build b/src/asahi/vulkan/meson.build
+index a72a6efe03957c125dc5286638cd2a1e392843be..bc3b2695c42935687a27e0f9b0eac4ec11413cd2 100644
+--- a/src/asahi/vulkan/meson.build
++++ b/src/asahi/vulkan/meson.build
+@@ -542,6 +542,18 @@ if with_tests
+     suite : ['asahi'],
+   )
+ 
++  test(
++    'hk_g15s_split_depth',
++    executable(
++      'hk_g15s_split_depth_test',
++      files('tests/test-hk-g15s-split-depth.c'),
++      include_directories : [include_directories('.'), inc_include, inc_src, inc_asahi],
++      dependencies : [idep_vulkan_runtime_headers],
++      c_args : [c_msvc_compat_args, '-UNDEBUG'],
++      gnu_symbol_visibility : 'hidden',
++    ),
++    suite : ['asahi'],
++  )
+   test(
+     'hk_memory_budget_core',
+     executable(
+diff --git a/src/asahi/vulkan/tests/test-hk-g15s-split-depth.c b/src/asahi/vulkan/tests/test-hk-g15s-split-depth.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..d0bc6e25e9469f7b58a07f0f9fc03cfb92b758a9
+--- /dev/null
++++ b/src/asahi/vulkan/tests/test-hk-g15s-split-depth.c
+@@ -0,0 +1,46 @@
++/* SPDX-License-Identifier: MIT */
++#include <assert.h>
++#include "hk_g15s_split_depth.h"
++
++int main(void)
++{
++   assert(hk_g15s_split_depth_plane(AGX_CHIP_G15S, 0,
++                                  VK_FORMAT_D32_SFLOAT_S8_UINT, 0, 1, true));
++   for (unsigned chip = AGX_CHIP_G13G; chip <= AGX_CHIP_UNKNOWN; ++chip) {
++      if (chip != AGX_CHIP_G15S)
++         assert(!hk_g15s_split_depth_plane(chip, 0,
++                     VK_FORMAT_D32_SFLOAT_S8_UINT, 0, 1, true));
++   }
++   assert(!hk_g15s_split_depth_plane(AGX_CHIP_G15S, 200,
++                                  VK_FORMAT_D32_SFLOAT_S8_UINT, 0, 1, true));
++   assert(!hk_g15s_split_depth_plane(AGX_CHIP_G15S, 0,
++                                  VK_FORMAT_D32_SFLOAT_S8_UINT, 1, 1, true));
++   assert(!hk_g15s_split_depth_plane(AGX_CHIP_G15S, 0,
++                                  VK_FORMAT_D32_SFLOAT_S8_UINT, 0, 2, true));
++   assert(!hk_g15s_split_depth_plane(AGX_CHIP_G15S, 0,
++                                  VK_FORMAT_D32_SFLOAT_S8_UINT, 0, 1, false));
++   for (unsigned fmt = VK_FORMAT_UNDEFINED; fmt <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK; ++fmt) {
++      if (fmt != VK_FORMAT_D32_SFLOAT_S8_UINT)
++         assert(!hk_g15s_split_depth_plane(AGX_CHIP_G15S, 0, fmt, 0, 1, true));
++   }
++   VkImageCreateInfo info = {
++      .imageType = VK_IMAGE_TYPE_2D, .tiling = VK_IMAGE_TILING_OPTIMAL,
++      .extent = {129, 127, 1}, .mipLevels = 1, .arrayLayers = 1,
++      .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
++               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++   };
++   assert(hk_g15s_split_depth_shape(&info));
++   VkImageCreateInfo bad = info;
++   bad.arrayLayers = 2; assert(!hk_g15s_split_depth_shape(&bad));
++   bad = info; bad.mipLevels = 2; assert(!hk_g15s_split_depth_shape(&bad));
++   bad = info; bad.extent.depth = 2; assert(!hk_g15s_split_depth_shape(&bad));
++   bad = info; bad.imageType = VK_IMAGE_TYPE_3D; assert(!hk_g15s_split_depth_shape(&bad));
++   bad = info; bad.tiling = VK_IMAGE_TILING_LINEAR; assert(!hk_g15s_split_depth_shape(&bad));
++   bad = info; bad.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT; assert(!hk_g15s_split_depth_shape(&bad));
++   VkImageUsageFlags blocked[] = {VK_IMAGE_USAGE_STORAGE_BIT,
++      VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT, VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT};
++   for (unsigned i = 0; i < sizeof(blocked) / sizeof(blocked[0]); ++i) {
++      bad = info; bad.usage |= blocked[i]; assert(!hk_g15s_split_depth_shape(&bad));
++   }
++   return 0;
++}

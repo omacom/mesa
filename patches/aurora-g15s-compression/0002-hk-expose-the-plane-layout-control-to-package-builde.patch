@@ -1,0 +1,42 @@
+From 7ff89a4da387bd561b78efd5f09c98ca8ae18538 Mon Sep 17 00:00:00 2001
+From: Chris Kearney <303316+iconidentify@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 02:00:50 -0700
+Subject: [PATCH 2/6] hk: expose the plane layout control to package builders
+
+Keep the production image control as an explicit non-default target when general tests are disabled. Preserve its assertions in release builds so package builders can execute the same layout contracts.
+
+Signed-off-by: Chris Kearney <303316+iconidentify@users.noreply.github.com>
+---
+ src/asahi/vulkan/meson.build | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/src/asahi/vulkan/meson.build b/src/asahi/vulkan/meson.build
+index 9cc8cb91c4a3fc75dd1a13325700fa519e17137c..a72a6efe03957c125dc5286638cd2a1e392843be 100644
+--- a/src/asahi/vulkan/meson.build
++++ b/src/asahi/vulkan/meson.build
+@@ -1116,17 +1116,20 @@ libvulkan_asahi = shared_library(
+   install : true,
+ )
+ 
+-if with_tests
+-  test('hk_explicit_plane_layout',
+-    executable('hk-explicit-plane-layout',
++hk_explicit_plane_layout_test = executable('hk-explicit-plane-layout',
+       files('tests/test-hk-explicit-plane-layout.c'),
+       include_directories : [inc_gallium, inc_gallium_aux, inc_include,
+                              inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+       dependencies : [hk_deps],
+       link_with : [libhk, libasahi_lib, libasahi_layout, libasahi_compiler],
+-      c_args : ['-Wno-c2x-extensions', '-ffunction-sections', '-fdata-sections'],
++      c_args : ['-Wno-c2x-extensions', '-ffunction-sections', '-fdata-sections',
++                '-UNDEBUG'],
+       link_args : ['-Wl,--gc-sections'],
+-    ),
++      build_by_default : false,
++)
++
++if with_tests
++  test('hk_explicit_plane_layout', hk_explicit_plane_layout_test,
+     suite : ['asahi'],
+   )
+ endif
