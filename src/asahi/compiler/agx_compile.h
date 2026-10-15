@@ -7,6 +7,7 @@
 
 #include "compiler/nir/nir.h"
 #include "util/shader_stats.h"
+#include "util/u_debug.h"
 #include "util/u_dynarray.h"
 #include "util/u_tristate.h"
 #include "shader_enums.h"
@@ -268,6 +269,30 @@ struct agx_device_key {
     * kernel, but that's functionally a hardware feature.
     */
    bool soft_fault;
+
+   /* Is the target GPU generation 13 (M1 family)? Selects the compute
+    * codegen defaults that are measured on G13 only.
+    */
+   bool g13;
+
+   /* Fold constant deltas between workgroup memory addresses into the
+    * lload/lstore index (agx_fold_shared_offsets). Measured on G13 and G14
+    * only.
+    */
+   bool fold_shared_offsets;
+
+   /* Hoist device loads of compute shaders above independent ALU, barriers
+    * and workgroup memory accesses (agx_hoist_loads). Measured on G13 and
+    * G14 only.
+    */
+   bool hoist_loads;
+
+   /* Index global accesses whose lea shift is below the format shift (the
+    * cooperative-matrix loads) by the scaled offset instead of a 64-bit
+    * address. Measured per device: on for the single-cluster G13 (M1), off
+    * on the multi-cluster G13C, where it slows dense GEMM.
+    */
+   bool fold_subformat_address;
 };
 
 struct agx_shader_key {
@@ -317,6 +342,15 @@ struct agx_shader_key {
 uint64_t agx_gather_texcoords(nir_shader *nir);
 
 void agx_preprocess_nir(nir_shader *nir);
+
+/* VK_KHR_cooperative_matrix on the G13 simd_matrix unit, with a software
+ * fallback for partial subgroups. On by default; AGX_SIMDMAT=0 disables it.
+ */
+static inline bool
+agx_simdmat_enabled(void)
+{
+   return debug_get_bool_option("AGX_SIMDMAT", true);
+}
 bool agx_nir_lower_discard_zs_emit(nir_shader *s);
 bool agx_nir_lower_sample_mask(nir_shader *s);
 bool agx_nir_lower_interpolation(nir_shader *s);
@@ -347,7 +381,6 @@ agx_round_registers(unsigned halfregs)
 }
 
 static const nir_shader_compiler_options agx_nir_options = {
-   .lower_fdiv = true,
    .float_mul_add16 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
    .float_mul_add32 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
    .lower_flrp16 = true,
