@@ -97,7 +97,16 @@ struct hk_device {
       simple_mtx_t lock;
    } scratch;
 
+   /* Set to 1 when the app creates a sparse image or buffer; never cleared. */
+   uint32_t sparse_used;
+
    uint32_t perftest;
+   /* HK_CDM_BARRIER_MASK=<hex>: perftest-only override of the per-launch
+    * CDM_BARRIER flag word (bits 0..26). 0 = unset. */
+   uint32_t cdm_barrier_mask;
+   /* HK_CDM_DEFER_FLUSH (hk_device.c): emit the CDM barrier at the end of
+    * each compute batch, not after vkCmdPipelineBarrier2. */
+   bool cdm_defer_flush;
 
    struct {
       struct u_rwlock lock;
@@ -114,6 +123,16 @@ enum hk_perftest {
    HK_PERF_NOBARRIER = BITFIELD_BIT(2),
    HK_PERF_BATCH = BITFIELD_BIT(3),
    HK_PERF_NOROBUST = BITFIELD_BIT(4),
+   HK_PERF_NOCDMBARRIER = BITFIELD_BIT(5),
+   HK_PERF_USCCDMBARRIER = BITFIELD_BIT(6),
+   HK_PERF_DESIGNEDUSCCDMBARRIER = BITFIELD_BIT(7),
+   /* Restore the unconditional per-launch CDM barrier and the batch split at
+    * every vkCmdPipelineBarrier2. The default on G13 is the
+    * dependency-tracked barrier; other chips default to this.
+    */
+   HK_PERF_ALWAYSCDMBARRIER = BITFIELD_BIT(8),
+   /* Use the dependency-tracked barrier on chips other than G13. */
+   HK_PERF_TRACKCDMBARRIER = BITFIELD_BIT(9),
 };
 
 #define HK_PERF(dev, flag) unlikely((dev)->perftest &HK_PERF_##flag)

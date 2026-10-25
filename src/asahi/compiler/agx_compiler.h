@@ -1031,6 +1031,7 @@ void agx_opt_compact_constants(agx_context *ctx);
 void agx_opt_promote_constants(agx_context *ctx);
 void agx_dce(agx_context *ctx, bool partial);
 void agx_pressure_schedule(agx_context *ctx);
+void agx_hoist_loads(agx_context *ctx);
 void agx_spill(agx_context *ctx, unsigned k, bool remat_only);
 void agx_repair_ssa(agx_context *ctx);
 void agx_reindex_ssa(agx_context *ctx);
@@ -1096,6 +1097,13 @@ bool agx_nir_opt_preamble(nir_shader *s, unsigned *sizes);
 bool agx_nir_lower_load_mask(nir_shader *shader);
 bool agx_nir_lower_ubo(nir_shader *shader);
 bool agx_nir_lower_shared_bitsize(nir_shader *shader);
+bool agx_nir_lower_simdmat(nir_shader *shader, unsigned subgroup_size);
+bool agx_nir_lower_cmat(nir_shader *shader);
+nir_def *agx_cmat_convert(struct nir_builder *b, nir_def *src,
+                          enum glsl_base_type from, enum glsl_base_type to);
+nir_def *agx_cmat_alu(struct nir_builder *b, nir_op op, enum glsl_base_type t,
+                      nir_def *x, nir_def *y);
+bool agx_nir_lower_bf16_conversions(nir_shader *shader);
 bool agx_nir_lower_frag_sidefx(nir_shader *s);
 
 struct agx_cycle_estimate {

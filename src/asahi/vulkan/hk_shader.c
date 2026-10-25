@@ -96,11 +96,40 @@ shared_var_info(const struct glsl_type *type, unsigned *size, unsigned *align)
    *size = comp_size * length, *align = comp_size;
 }
 
+/* Large constant arrays become compute-shader constant data; HK_LARGE_CONSTANTS=0
+ * keeps the per-invocation scratch copy (A/B and bisect only).
+ */
+static bool
+hk_large_constants(void)
+{
+   return debug_get_bool_option("HK_LARGE_CONSTANTS", true);
+}
+
+/* Compute load hoist: on by default on generation 13 (M1 family), opt-in on
+ * generation 14 with AGX_HOIST_LOADS=1, never on other generations.
+ * AGX_HOIST_LOADS=0 turns it off everywhere. Part of the compiler flags, so
+ * toggling it never serves a shader cached under the other setting.
+ */
+static bool
+hk_hoist_loads_enabled(const struct hk_physical_device *pdev)
+{
+   const unsigned gen = pdev->dev.params.gpu_generation;
+
+   return (gen == 13 || gen == 14) &&
+          debug_get_bool_option("AGX_HOIST_LOADS", gen == 13);
+}
+
 uint64_t
 hk_physical_device_compiler_flags(const struct hk_physical_device *pdev)
 {
-   /* This could be optimized but it doesn't matter */
-   return pdev->dev.debug;
+   static_assert(sizeof(pdev->dev.debug) == sizeof(uint32_t));
+   return pdev->dev.debug |
+         ((uint64_t)agx_simdmat_enabled() << 32) |
+         ((uint64_t)(getenv("AGX_HWMAT_VEC2_OFF") != NULL) << 34) |
+         ((uint64_t)(getenv("AGX_LOCAL_FOLD_OFF") != NULL) << 35) |
+         ((uint64_t)(getenv("AGX_SCHED_COMPUTE") != NULL) << 36) |
+         ((uint64_t)hk_hoist_loads_enabled(pdev) << 37) |
+         ((uint64_t)hk_large_constants() << 40);
 }
 
 const nir_shader_compiler_options *
@@ -173,6 +202,18 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
 
    NIR_PASS(_, nir, nir_split_var_copies);
    NIR_PASS(_, nir, nir_split_struct_vars, nir_var_function_temp);
+
+   /* Constant arrays that nir_lower_vars_to_scratch (in agx_preprocess_nir,
+    * same 256 B threshold) would give every invocation a scratch copy of
+    * become shader constant data read through the root table instead.
+    * Smaller indirectly indexed arrays keep their if-else lowering. Compute
+    * only: graphics stages have no root field for it.
+    * nir_opt_large_constants cannot see through copy_deref.
+    */
+   if (nir->info.stage == MESA_SHADER_COMPUTE && hk_large_constants()) {
+      NIR_PASS(_, nir, nir_lower_var_copies);
+      NIR_PASS(_, nir, nir_opt_large_constants, NULL, 256);
+   }
 
    /* Optimize but allow copies because we haven't lowered them yet */
    agx_preprocess_nir(nir);
@@ -829,8 +870,6 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
             nir_address_format_32bit_offset);
 
-   // NIR_PASS(_, nir, nir_opt_large_constants, NULL, 32);
-
    /* Turn cache flushes into image coherency bits while we still have derefs */
    NIR_PASS(_, nir, nir_lower_memory_model);
 
@@ -937,7 +976,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             nir_opt_if_optimize_phi_true_false | nir_opt_if_avoid_64bit_phis);
 }
 
-static void
+static VkResult
 hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
 {
    if (shader->b.info.has_preamble || shader->b.info.rodata.size_16) {
@@ -947,9 +986,22 @@ hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
 
       shader->bo = agx_bo_create(&dev->dev, size, 0,
                                  AGX_BO_EXEC | AGX_BO_LOW_VA, "Preamble");
+      if (!shader->bo)
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
       memcpy(agx_bo_map(shader->bo), shader->b.binary, size);
       shader->preamble_addr =
          shader->bo->va->addr + shader->b.info.preamble_offset;
+   }
+
+   if (shader->data_size) {
+      shader->data_bo =
+         agx_bo_create(&dev->dev, shader->data_size, 0, 0, "Shader constants");
+      if (!shader->data_bo)
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+      memcpy(agx_bo_map(shader->data_bo), shader->data_ptr, shader->data_size);
+      shader->data_addr = shader->data_bo->va->addr;
    }
 
    if (!shader->linked.ht) {
@@ -968,6 +1020,7 @@ hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
          shader->b.info.sampler_state_count, false);
       cfg.texture_state_register_count = shader->b.info.texture_state_count;
    }
+   return VK_SUCCESS;
 }
 
 DERIVE_HASH_TABLE(hk_fast_link_key_vs);
@@ -1178,6 +1231,9 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       .promote_textures = true,
    };
 
+   backend_key.dev.hoist_loads =
+      hk_hoist_loads_enabled(hk_device_physical(dev));
+
    /* For now, sample shading is always dynamic. Indicate that. */
    if (nir->info.stage == MESA_SHADER_FRAGMENT &&
        nir->info.fs.uses_sample_shading)
@@ -1237,9 +1293,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    VkResult result = hk_init_link_ht(shader, sw_stage);
    if (result != VK_SUCCESS)
       return vk_error(dev, result);
-
-   hk_upload_shader(dev, shader);
-   return VK_SUCCESS;
+   return hk_upload_shader(dev, shader);
 }
 
 static const struct vk_shader_ops hk_shader_ops;
@@ -1257,6 +1311,7 @@ hk_shader_destroy(struct hk_device *dev, struct hk_shader *s)
    free((void *)s->code_ptr);
    free((void *)s->data_ptr);
    agx_bo_unreference(&dev->dev, s->bo);
+   agx_bo_unreference(&dev->dev, s->data_bo);
 
    simple_mtx_destroy(&s->linked.lock);
 
@@ -1632,8 +1687,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    shader->b.binary = (void *)shader->code_ptr;
-   hk_upload_shader(dev, shader);
-   return VK_SUCCESS;
+   return hk_upload_shader(dev, shader);
 }
 
 static VkResult
