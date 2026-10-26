@@ -101,12 +101,11 @@ hk_get_device_extensions(const struct agx_device *dev,
                          struct vk_device_extension_table *ext)
 {
    /* Keep the upstream AGX2 extension profile until the newly added common
-    * implementations have been qualified there. Native AGX3 and M5 keep
-    * their existing exposure.
+    * implementations have been qualified there. Every chip on the native
+    * graphics path (G15, G16G, G17P) and M5 takes the extended profile.
     */
-   const bool native_agx3 = (agx_chip_native_agx3(dev->chip) &&
-                             dev->params.gpu_generation > 15) ||
-                            agx_chip_g17_m5(dev->chip);
+   const bool native_agx3 =
+      agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip);
 
    /*
     * VK_KHR_ray_query and everything it depends on.  Software traversal:
@@ -1214,11 +1213,13 @@ hk_get_device_properties(const struct agx_device *dev,
                                    ? HK_M5_SPARSE_ADDR_SPACE_SIZE
                                    : HK_SPARSE_ADDR_SPACE_SIZE,
       /* The classic AGX2 root upload has one USC uniform record, limited
-       * to 64 halfwords. Keep upstream's eight-set limit: the native
-       * sixteen-set root needs 68 halfwords and uses a separate loader.
+       * to 64 halfwords, so it keeps upstream's eight-set limit. The native
+       * root loader (hk_agx3_g17p_root_range()) takes all sixteen sets and
+       * runs on every native graphics chip, G15 included.
        */
       .maxBoundDescriptorSets =
-         dev->params.gpu_generation <= 15 ? 8 : HK_MAX_SETS,
+         dev->params.gpu_generation <= 15 && !agx_chip_native_agx3(dev->chip)
+            ? 8 : HK_MAX_SETS,
       /* VK_KHR_acceleration_structure limits.  The counts are the
        * specification's own 24/29-bit encoding maxima, which is what bounds
        * us: the geometry, instance and primitive ids all live in packed
