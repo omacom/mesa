@@ -2931,6 +2931,21 @@ hk_tes_ray_queries_in_compute(const struct hk_device *dev)
           dev->gen1_native_rq && dev->gen1_native_graphics_rq;
 }
 
+/* A uniform buffer does not change during a draw or dispatch. */
+static bool
+hk_ubo_loads_reorderable(nir_builder *b, nir_intrinsic_instr *intr,
+                         UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_deref ||
+       !nir_deref_mode_is(nir_src_as_deref(intr->src[0]), nir_var_mem_ubo))
+      return false;
+
+   nir_intrinsic_set_access(intr, nir_intrinsic_access(intr) |
+                                     ACCESS_CAN_REORDER |
+                                     ACCESS_NON_WRITEABLE);
+   return true;
+}
+
 static void
 hk_lower_nir(struct hk_device *dev, nir_shader *nir,
              const struct vk_pipeline_robustness_state *rs, bool is_multiview,
@@ -3104,6 +3119,28 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             hk_buffer_addr_format(rs->storage_buffers,
                                   rs->null_storage_buffer_descriptor,
                                   agx_chip_g17_m5(dev->dev.chip)));
+   /* While UBO offsets are still 32-bit deref offsets, merge the loads of a
+    * block that read the same record: once lowered, their 64-bit addresses
+    * hide how they relate. Components of a vector become loads of the whole
+    * vector, so that reads of one record's .xy and .z are the same load. A
+    * uniform buffer does not change during a draw or dispatch, so its loads
+    * may be reordered, as load_ubo always may: repeated ones are then merged
+    * and loop invariant ones may leave the loop. */
+   NIR_PASS(_, nir, nir_lower_array_deref_of_vec, nir_var_mem_ubo, NULL,
+            nir_lower_direct_array_deref_of_vec_load);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_ubo_loads_reorderable,
+            nir_metadata_control_flow, NULL);
+   NIR_PASS(_, nir, nir_opt_cse);
+   NIR_PASS(_, nir, nir_opt_load_store_vectorize,
+            &(const nir_load_store_vectorize_options){
+               .modes = nir_var_mem_ubo,
+               .robust_modes =
+                  rs->uniform_buffers ==
+                        VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT
+                     ? 0
+                     : nir_var_mem_ubo,
+               .callback = agx_mem_vectorize_cb,
+            });
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
             hk_ubo_addr_format(rs->uniform_buffers));
 
