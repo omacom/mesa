@@ -2807,13 +2807,13 @@ agx3_cube_register_budget(agx_context *ctx)
           (I->dim != AGX_DIM_CUBE && I->dim != AGX_DIM_CUBE_ARRAY))
          continue;
 
+      /* A plain cube sample stages a register level or bias with CEM's face
+       * in a form that encodes the face's high bit, so only the level needs
+       * a seven-bit register, and RA keeps it there (texture_gpr). The bias
+       * with minimum also places a packed word above the allocation. */
       const bool bias_min = I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS_MIN;
-      const bool register_lod = bias_min ||
-         ((I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
-           I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS) &&
-          I->src[1].type != AGX_INDEX_IMMEDIATE);
       budget = MIN2(budget,
-                    (I->dim == AGX_DIM_CUBE_ARRAY || register_lod) ? 112 :
+                    (I->dim == AGX_DIM_CUBE_ARRAY || bias_min) ? 112 :
                     AGX3B_NUM_REGS - 8);
    }
    return ROUND_DOWN_TO(budget, alignment);
@@ -3270,6 +3270,13 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
          if (I->op == AGX_OPCODE_TEXTURE_SAMPLE && I->shadow &&
              I->src[5].type == AGX_INDEX_NORMAL)
             BITSET_SET(texture_gpr, I->src[5].value);
+
+         /* A cube sample's register level or bias is a seven-bit operand of
+          * the staging PACK_SMPIR (agx3_tex_stage_cube_lod). */
+         if (I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
+             (I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY) &&
+             I->src[1].type == AGX_INDEX_NORMAL)
+            BITSET_SET(texture_gpr, I->src[1].value);
       }
 
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
