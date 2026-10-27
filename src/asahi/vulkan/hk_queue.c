@@ -196,6 +196,14 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
    c->width_px = empty_attachmentless ? 1 : cs->cr.width;
    c->height_px = empty_attachmentless ? 1 : cs->cr.height;
 
+   /* Draws stay inside the render area and the tiles past its bottom-right
+    * corner keep their contents, so do not walk them: user interfaces render
+    * small areas of full-screen targets. */
+   if (cs->area_x1 && cs->area_y1) {
+      c->width_px = MIN2(c->width_px, cs->area_x1);
+      c->height_px = MIN2(c->height_px, cs->area_y1);
+   }
+
    c->isp_bgobjdepth = cs->cr.isp_bgobjdepth;
    c->isp_bgobjvals = cs->cr.isp_bgobjvals;
 
