@@ -404,7 +404,9 @@ hk_sampler_heap_remove(struct hk_device *dev, struct hk_rc_sampler *rc)
 static void
 hk_init_vm_status_mirror(struct hk_device *dev)
 {
-   if (!(dev->dev.params.features & DRM_ASAHI_FEATURE_VM_STATUS) ||
+   /* virtio: dev->dev.fd is the virtgpu fd, asahi ioctls don't go there. */
+   if (dev->dev.is_virtio ||
+       !(dev->dev.params.features & DRM_ASAHI_FEATURE_VM_STATUS) ||
        !(dev->dev.params.features & DRM_ASAHI_FEATURE_VM_STATUS_MIRROR))
       return;
 
@@ -503,7 +505,15 @@ hk_check_status(struct vk_device *device)
       if (error)
          return vk_device_set_lost(&dev->vk, "GPU VM %u failed: %s",
                                    dev->dev.vm_id, strerror(-error));
-   } else if (dev->dev.params.features & DRM_ASAHI_FEATURE_VM_STATUS) {
+   } else if (dev->dev.async_errors) {
+      /* virtio submits are asynchronous: the host counts the ones its kernel
+       * rejected (a lost VM rejects every later submit) instead of failing them. */
+      uint32_t errors = p_atomic_read(dev->dev.async_errors);
+      if (errors != dev->async_errors_base)
+         return vk_device_set_lost(&dev->vk, "host rejected %u virtio commands",
+                                   errors - dev->async_errors_base);
+   } else if (!dev->dev.is_virtio &&
+              (dev->dev.params.features & DRM_ASAHI_FEATURE_VM_STATUS)) {
       struct drm_asahi_vm_status status = {.vm_id = dev->dev.vm_id};
       struct drm_asahi_get_params query = {
          .param_group = DRM_ASAHI_PARAM_GROUP_VM_STATUS,
@@ -898,6 +908,8 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->vk.check_status = hk_check_status;
    dev->vk.get_timestamp = hk_get_timestamp;
    hk_init_vm_status_mirror(dev);
+   if (dev->dev.async_errors)
+      dev->async_errors_base = p_atomic_read(dev->dev.async_errors);
 
    /* This holds for current platforms. We do not currently implement
     * timestamp scaling, this would require changes in the query copy kernel

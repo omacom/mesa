@@ -322,5 +322,8 @@ agx_virtio_open_device(struct agx_device *dev)
 
    dev->vdrm = vdrm;
    dev->ops = agx_virtio_device_ops;
+   struct asahi_shmem *shmem = to_asahi_shmem(vdrm->shmem);
+   if (vdrm_shmem_has_field(shmem, async_error))
+      dev->async_errors = &shmem->async_error;
    return true;
 }
