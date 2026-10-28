@@ -2237,6 +2237,29 @@ agx3_is_staged_3d_bias_min(const agx_instr *I)
           !I->offset_xyz;
 }
 
+/* A cube sample with its own CEM scratch (agx3_reserve_cube_scratch)
+ * uses it in place of the shared scratch above the allocation. */
+static bool
+agx3_cube_own_scratch(const agx_instr *I)
+{
+   return I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
+          (I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY) &&
+          !I->agx3_cube_scalar_coords && I->nr_srcs == 7 &&
+          I->src[6].type == AGX_INDEX_REGISTER;
+}
+
+static const uint16_t *
+agx3_cube_scratch(const agx_instr *I, const uint16_t shared[3],
+                  uint16_t own[3])
+{
+   if (!agx3_cube_own_scratch(I))
+      return shared;
+   own[0] = I->src[6].value;
+   own[1] = I->src[6].value + 4;
+   own[2] = I->src[6].value + 6;
+   return own;
+}
+
 /* Filtered 2D samples use scoreboard-signalling native staging producers.
  * Plain implicit 2D keeps its coordinate layout. Explicit per-lane LOD and
  * 2D-array samples stage coordinates into bank 0; their auxiliary scalar is
@@ -2258,7 +2281,10 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
    const bool published = agx_texture_resource(I) != 0;
    const bool scalar_cube = I->agx3_cube_scalar_coords;
    const bool split = I->agx3_split_coords;
-   const unsigned source_count = scalar_cube || split ? 8 : 6;
+   const unsigned source_count = scalar_cube || split ? 8
+                                 : agx3_cube_own_scratch(I) ? 7 : 6;
+   uint16_t own_cem_scratch[3];
+   cem_scratch = agx3_cube_scratch(I, cem_scratch, own_cem_scratch);
    const bool explicit_lod = I->lod_mode == AGX_LOD_MODE_LOD_MIN;
    const bool bias_min = I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS_MIN;
    const bool gradient_min = I->lod_mode == AGX_LOD_MODE_LOD_GRAD_MIN;
@@ -9203,7 +9229,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                ((scan_I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
                  scan_I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS) &&
                 scan_I->src[1].type != AGX_INDEX_IMMEDIATE);
-            has_cube_sample = true;
+            has_cube_sample |= !agx3_cube_own_scratch(scan_I);
             /* So is a cube face packed beside a bias and minimum. */
             if (register_lod &&
                 (scan_I->dim == AGX_DIM_CUBE_ARRAY || bias_min))
@@ -9850,7 +9876,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                ((I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
                  I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS) &&
                 I->src[1].type != AGX_INDEX_IMMEDIATE);
-            const uint16_t *scratch = cem_scratch;
+            uint16_t own_scratch[3];
+            const uint16_t *scratch =
+               agx3_cube_scratch(I, cem_scratch, own_scratch);
             assert(nd + 5 <= AGX3_SLOT_MAX_REGS);
             e->dst[nd++] = scratch[0];
             e->dst[nd++] = scratch[0] + 2;

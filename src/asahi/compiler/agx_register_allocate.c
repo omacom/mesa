@@ -2799,6 +2799,7 @@ agx3_cube_register_budget(agx_context *ctx)
 {
    unsigned budget = AGX3B_NUM_REGS;
    unsigned alignment = 8;
+   bool shared_cem = false, packed_layer = false;
    agx_foreach_instr_global(ctx, I) {
       agx_foreach_ssa_dest(I, d)
          alignment = MAX2(alignment,
@@ -2809,13 +2810,30 @@ agx3_cube_register_budget(agx_context *ctx)
 
       /* A plain cube sample stages a register level or bias with CEM's face
        * in a form that encodes the face's high bit, so only the level needs
-       * a seven-bit register, and RA keeps it there (texture_gpr). The bias
-       * with minimum also places a packed word above the allocation. */
+       * a seven-bit register, and RA keeps it there (texture_gpr). A cube
+       * array stages its face in a seven-bit field, from its own CEM scratch
+       * (agx3_reserve_cube_scratch) where it has one. The bias with
+       * minimum also places a packed word above the allocation. */
       const bool bias_min = I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS_MIN;
+      /* With its own scratch, nothing of a cube sample sits above the
+       * allocation but a cube array's packed layer word. Its budget keeps
+       * the shader at 576 threads: Counter-Strike 2's register-heavy
+       * cube-array material passes ran faster at 177 halves than at 185
+       * (512 threads), though they spill a little more. */
+      const bool own_scratch = !I->agx3_cube_scalar_coords && I->nr_srcs == 7;
       budget = MIN2(budget,
-                    (I->dim == AGX_DIM_CUBE_ARRAY || bias_min) ? 112 :
-                    AGX3B_NUM_REGS - 8);
+                    ((I->dim == AGX_DIM_CUBE_ARRAY && !own_scratch) || bias_min)
+                       ? 112 : own_scratch ? AGX3B_NUM_REGS - 16
+                                           : AGX3B_NUM_REGS - 8);
+      shared_cem |= !own_scratch;
+      packed_layer |= own_scratch && I->src[1].type != AGX_INDEX_IMMEDIATE &&
+                      (I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
+                       I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS);
    }
+   /* The shared CEM scratch and a cube array's prepacked layer word both sit
+    * above the allocation, below half 191. */
+   if (shared_cem && packed_layer)
+      budget = MIN2(budget, AGX3B_NUM_REGS - 16);
    return ROUND_DOWN_TO(budget, alignment);
 }
 
@@ -3277,6 +3295,13 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
              (I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY) &&
              I->src[1].type == AGX_INDEX_NORMAL)
             BITSET_SET(texture_gpr, I->src[1].value);
+
+         /* A cube array's own CEM scratch holds its face, a seven-bit operand
+          * of the staging PACK_SMPIR (agx3_tex_stage_cube_array_layer). */
+         if (I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
+             I->dim == AGX_DIM_CUBE_ARRAY && I->nr_srcs == 7 &&
+             I->src[6].type == AGX_INDEX_NORMAL)
+            BITSET_SET(texture_gpr, I->src[6].value);
       }
 
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&

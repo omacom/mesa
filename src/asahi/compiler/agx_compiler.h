@@ -1210,6 +1210,7 @@ bool agx3_fuse_fma_texture_publications(agx_context *ctx);
 bool agx3_lower_scalar_texture_publications(agx_context *ctx);
 bool agx3_lower_scalar_cube_coordinates(agx_context *ctx);
 bool agx3_split_texture_coordinates(agx_context *ctx);
+bool agx3_reserve_cube_scratch(agx_context *ctx);
 void agx_lower_uniform_sources(agx_context *ctx);
 void agx_opt_cse(agx_context *ctx);
 bool agx_opt_collect_split(agx_context *ctx);
