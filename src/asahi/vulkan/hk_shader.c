@@ -93,6 +93,7 @@
 #include "util/blob.h"
 #include "util/hash_table.h"
 #include "util/macros.h"
+#include "util/disk_cache.h"
 #include "util/mesa-blake3.h"
 #include "util/os_time.h"
 #include "util/simple_mtx.h"
@@ -5507,6 +5508,108 @@ hk_compile_fs_sample_variant(struct hk_device *dev,
    return result;
 }
 
+static VkResult hk_deserialize_shader(struct hk_device *dev,
+                                      struct blob_reader *blob,
+                                      struct hk_shader *shader, bool absent,
+                                      bool cache_candidate);
+static void hk_shader_serialize(struct vk_device *vk_dev,
+                                const struct hk_shader *shader,
+                                struct blob *blob);
+
+/* A multisample variant is built at its first draw, after its shader object
+ * went into the pipeline cache, so the cached object never holds it and every
+ * process compiled it again on the draw that needs it. Keep each built variant
+ * in the disk cache under its own key: the saved source and compile inputs,
+ * which name its NIR and key, and the sample count. */
+static bool
+hk_fs_sample_variant_cache_key(struct hk_device *dev,
+                               const struct hk_fs_sample_source *src,
+                               unsigned samples, cache_key out)
+{
+   struct disk_cache *cache = hk_device_physical(dev)->vk.disk_cache;
+   if (!cache)
+      return false;
+   struct mesa_blake3 ctx;
+   blake3_hash hash;
+   _mesa_blake3_init(&ctx);
+   static const char tag[] = "hk fs sample variant";
+   _mesa_blake3_update(&ctx, tag, sizeof(tag));
+   _mesa_blake3_update(&ctx, &samples, sizeof(samples));
+   _mesa_blake3_update(&ctx, &src->key, sizeof(src->key));
+   _mesa_blake3_update(&ctx, &src->flags, sizeof(src->flags));
+   _mesa_blake3_update(&ctx, &src->robustness, sizeof(src->robustness));
+   _mesa_blake3_update(&ctx, &src->features, sizeof(src->features));
+   _mesa_blake3_update(&ctx, &src->set_layout_count,
+                       sizeof(src->set_layout_count));
+   _mesa_blake3_update(&ctx, &src->static_set_mask,
+                       sizeof(src->static_set_mask));
+   _mesa_blake3_update(&ctx, src->nir, src->nir_size);
+   _mesa_blake3_final(&ctx, hash);
+   disk_cache_compute_key(cache, hash, sizeof(hash), out);
+   return true;
+}
+
+/* The variant and the NIR its inline blending is rebuilt from at fast-link,
+ * as hk_api_shader_serialize() writes them for one variant. */
+static bool
+hk_fs_sample_variant_load(struct hk_device *dev, struct hk_shader *shader,
+                          const cache_key key)
+{
+   size_t size;
+   void *data = disk_cache_get(hk_device_physical(dev)->vk.disk_cache, key,
+                               &size);
+   if (!data)
+      return false;
+   struct blob_reader blob;
+   blob_reader_init(&blob, data, size);
+   bool ok = hk_deserialize_shader(dev, &blob, shader, false, false) ==
+             VK_SUCCESS;
+   const uint32_t mono_size = ok ? blob_read_uint32(&blob) : 0;
+   if (ok && mono_size) {
+      const void *mono_nir = blob_read_bytes(&blob, mono_size);
+      const void *mono_key =
+         blob_read_bytes(&blob, sizeof(shader->g17p_mono_key));
+      shader->g17p_mono_nir = blob.overrun ? NULL : malloc(mono_size);
+      ok = shader->g17p_mono_nir != NULL;
+      if (ok) {
+         memcpy(shader->g17p_mono_nir, mono_nir, mono_size);
+         shader->g17p_mono_nir_size = mono_size;
+         memcpy(&shader->g17p_mono_key, mono_key,
+                sizeof(shader->g17p_mono_key));
+      }
+   }
+   ok &= !blob.overrun && blob.current == blob.end;
+   free(data);
+   if (!ok) {
+      /* A stale or damaged entry: compile instead, from a clean variant. */
+      hk_shader_destroy(dev, shader, true);
+      memset(shader, 0, sizeof(*shader));
+   }
+   return ok;
+}
+
+static void
+hk_fs_sample_variant_store(struct hk_device *dev,
+                           const struct hk_shader *shader,
+                           const cache_key key)
+{
+   struct blob blob;
+   blob_init(&blob);
+   hk_shader_serialize(&dev->vk, shader, &blob);
+   const uint32_t mono_size = shader->g17p_mono_nir ?
+      shader->g17p_mono_nir_size : 0;
+   blob_write_uint32(&blob, mono_size);
+   if (mono_size) {
+      blob_write_bytes(&blob, shader->g17p_mono_nir, mono_size);
+      blob_write_bytes(&blob, &shader->g17p_mono_key,
+                       sizeof(shader->g17p_mono_key));
+   }
+   if (!blob.out_of_memory)
+      disk_cache_put(hk_device_physical(dev)->vk.disk_cache, key, blob.data,
+                     blob.size, NULL);
+   blob_finish(&blob);
+}
+
 VkResult
 hk_fs_build_sample_variant(struct hk_device *dev, struct hk_api_shader *obj,
                            unsigned samples)
@@ -5522,14 +5625,24 @@ hk_fs_build_sample_variant(struct hk_device *dev, struct hk_api_shader *obj,
    VkResult result = VK_SUCCESS;
    simple_mtx_lock(&src->lock);
    if (!(src->ready_mask & BITFIELD_BIT(i))) {
-      struct blob_reader reader;
-      blob_reader_init(&reader, src->nir, src->nir_size);
-      nir_shader *nir = nir_deserialize(NULL, &agx_nir_options, &reader);
-      if (nir) {
+      cache_key key;
+      const bool cacheable =
+         hk_fs_sample_variant_cache_key(dev, src, samples, key);
+      if (cacheable && hk_fs_sample_variant_load(dev, &obj->variants[i], key)) {
          src->owned_mask |= BITFIELD_BIT(i);
-         result = hk_compile_fs_sample_variant(dev, NULL, nir, obj, samples);
+         p_atomic_set(&src->ready_mask, src->ready_mask | BITFIELD_BIT(i));
       } else {
-         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         struct blob_reader reader;
+         blob_reader_init(&reader, src->nir, src->nir_size);
+         nir_shader *nir = nir_deserialize(NULL, &agx_nir_options, &reader);
+         if (nir) {
+            src->owned_mask |= BITFIELD_BIT(i);
+            result = hk_compile_fs_sample_variant(dev, NULL, nir, obj, samples);
+            if (result == VK_SUCCESS && cacheable)
+               hk_fs_sample_variant_store(dev, &obj->variants[i], key);
+         } else {
+            result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         }
       }
    }
    simple_mtx_unlock(&src->lock);
