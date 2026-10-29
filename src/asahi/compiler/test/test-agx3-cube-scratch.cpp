@@ -65,3 +65,31 @@ TEST(AGX3CubeScratch, CubeSamplesReadAnUndefinedScratchVector)
    EXPECT_FALSE(agx3_reserve_cube_scratch(b->shader));
    ralloc_free(mem);
 }
+
+/* A cube sample that reads its scratch is valid IR: the scratch source is
+ * four words wide. agx_validate checks only in builds with assertions. */
+TEST(AGX3CubeScratch, ScratchSourceValidates)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   for (unsigned array = 0; array < 2; ++array) {
+      const unsigned comps = 3 + array;
+      agx_index coords = agx_vec_temp(b->shader, AGX_SIZE_32, comps);
+      agx_instr *collect = agx_collect_to(b, coords, comps);
+      agx_foreach_src(collect, c)
+         collect->src[c] = agx_undef(AGX_SIZE_32);
+      agx_texture_sample_to(b, agx_vec_temp(b->shader, AGX_SIZE_16, 4), coords,
+                            agx_immediate(0), agx_immediate(0),
+                            agx_immediate(0), agx_immediate(0), agx_null(),
+                            array ? AGX_DIM_CUBE_ARRAY : AGX_DIM_CUBE,
+                            AGX_LOD_MODE_AUTO_LOD, 0xf, false, false, false,
+                            AGX_GATHER_NONE, false);
+   }
+   agx_validate(b->shader, "cube sample test shader");
+   ASSERT_TRUE(agx3_reserve_cube_scratch(b->shader));
+   agx_validate(b->shader, "cube-array scratch");
+   ralloc_free(mem);
+}
