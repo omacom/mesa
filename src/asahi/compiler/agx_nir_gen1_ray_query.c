@@ -210,10 +210,12 @@ gen1_rq_hw_fields(const nir_intrinsic_instr *intr)
 /* After each trace or refill, take the hardware's committed hit when it is
  * closer than the committed one, so candidate pruning and confirmation compare
  * against the closest hit so far. Traversal clears query word 256 first, so a
- * hit tag there is this query's. */
+ * hit tag there is this query's. With TerminateOnFirstHit the merged hit ends
+ * the query, as a software commit of an opaque triangle does. */
 static void
 gen1_rq_merge_hw_commit(nir_builder *b, nir_def *id, nir_def *query,
                         nir_def *lane, nir_deref_instr *flags,
+                        nir_deref_instr *active,
                         nir_deref_instr *result[4], unsigned fields)
 {
    nir_push_if(b, gen1_rq_hw_commits(b, flags));
@@ -239,6 +241,9 @@ gen1_rq_merge_hw_commit(nir_builder *b, nir_def *id, nir_def *query,
                                           nir_iand_imm(b, nir_channel(b, ids, 0), 0xffffff)), 15);
    nir_store_deref(b, result[3], nir_vec4(b, nir_channel(b, uv, 0), nir_channel(b, uv, 1),
                                           zero, zero), 15);
+   nir_push_if(b, nir_test_mask(b, nir_load_deref(b, flags), 4));
+   nir_store_deref(b, active, nir_imm_false(b), 1);
+   nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
 }
@@ -293,9 +298,9 @@ gen1_candidate_next(nir_builder *b,nir_deref_instr *active,nir_deref_instr *curs
    nir_store_deref(b,active,nir_imm_false(b),1);nir_jump(b,nir_jump_break);
    nir_pop_if(b,NULL);
    nir_def *completed=agx_nir_gen1_refill_candidate_queue(b,query,lane,id,nir_channel(b,nir_load_deref(b,result[1]),2));
-   gen1_rq_merge_hw_commit(b,id,query,lane,flags,result,hw_fields);
    nir_store_deref(b,active,completed,1);
-   nir_break_if(b,nir_inot(b,completed));
+   gen1_rq_merge_hw_commit(b,id,query,lane,flags,active,result,hw_fields);
+   nir_break_if(b,nir_inot(b,nir_load_deref(b,active)));
    nir_store_deref(b,cursor,nir_imm_int(b,0),1);
    nir_pop_if(b,NULL);nir_pop_loop(b,NULL);
 }
@@ -678,9 +683,9 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
             nir_load_preamble(&b,1,64,.base=layout->candidates ? 12 : 112),query,lane,
             nir_iadd_imm(&b,id,layout->launch_header),layout->candidates ? 123 : 126,layout->status_uniform);
          if(layout->candidates) {
-            gen1_rq_merge_hw_commit(&b,id,query,lane,flags,result,hw_fields);
             nir_store_deref(&b,started,nir_imm_true(&b),1);
             nir_store_deref(&b,active,completed,1);
+            gen1_rq_merge_hw_commit(&b,id,query,lane,flags,active,result,hw_fields);
          } else {
          nir_push_if(&b,completed);
          for(unsigned i=0;i<2;i++)
