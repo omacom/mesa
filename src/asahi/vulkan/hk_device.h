@@ -369,11 +369,13 @@ enum hk_perftest {
  * a timestamp or query copy closed it partway through a command buffer,
  * hk_CmdPipelineBarrier2() and hk_CmdSetEvent2() record the flush into a
  * stream ordered after the source scope, as a host-read dependency does,
- * and order the destination after that stream. That the hardware writes
- * those earlier lines back from a flush in a later stream has not been
- * tested. Not covered: a resource created after the command buffer was
- * recorded and reached through a path recording did not see, that is a
- * device address the command buffer reads indirectly, or a descriptor set
+ * and order the destination after that stream. When the open stream holds
+ * work unrelated to the source, the flush goes at its end and a graphics
+ * destination is ordered after that stream too (hk_sync_after_alias_flush()).
+ * That the hardware writes those earlier lines back from a flush in a later
+ * stream has not been tested. Not covered: a resource created after the command
+ * buffer was recorded and reached through a path recording did not see, that is
+ * a device address the command buffer reads indirectly, or a descriptor set
  * bound at recording and updated after it (descriptorBinding*UpdateAfterBind).
  * Graphics-only sources also do not request memory scope: attachment or
  * shader writes through a sparse image followed by transfer or compute
