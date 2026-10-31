@@ -412,6 +412,54 @@ xfer_write(struct hk_cmd_buffer *cmd, uint64_t lo, uint64_t hi, bool bda)
    return cs;
 }
 
+/* A transfer ends in A; unrelated compute opens B, where the alias flush
+ * is recorded. Exercise the production ordering helper and resolver without
+ * a GPU payload. The ordinary source cut alone reaches only A. */
+static void
+test_alias_flush_order(void)
+{
+   const uint8_t gfx_kinds[] = {HK_SYNC_GFX, HK_SYNC_GFX_FRAG, HK_SYNC_GFX_IMG};
+   for (unsigned g = 0; g < ARRAY_SIZE(gfx_kinds); ++g) {
+      const uint8_t dst = gfx_kinds[g];
+      struct hk_cmd_buffer *cmd = new_cmd();
+      struct hk_cs *a = xfer_write(cmd, 0x10000, 0x20000, false);
+      struct hk_cs *b = add(cmd, true);
+      hk_sync_barrier(cmd, HK_SYNC_XFER, dst);
+      T("transfer source cut excludes unrelated flush stream",
+        cmd->sync.req[util_logbase2(dst)][HK_SYNC_CDM].cut == a);
+      hk_sync_after_alias_flush(cmd, b, dst);
+      T("alias flush extends graphics requirement to B",
+        cmd->sync.req[util_logbase2(dst)][HK_SYNC_CDM].cut == b);
+      hk_sync_begin_rendering(cmd, false);
+      struct hk_cs *render = add(cmd, false);
+      if (dst == HK_SYNC_GFX_IMG)
+         hk_sync_vertex_images(cmd, render);
+      hk_sync_end_rendering(cmd);
+      T("alias flush ordering resolves", submit(new_queue(true), cmd));
+      T("render waits for B's alias flush, not only A",
+        (dst == HK_SYNC_GFX_IMG ? render->sync.barrier_ta[HK_SYNC_CDM]
+                               : render->sync.barrier[HK_SYNC_CDM]) ==
+        b->sync.index);
+
+      cmd = new_cmd();
+      b = xfer_write(cmd, 0x10000, 0x20000, false);
+      hk_sync_barrier(cmd, HK_SYNC_XFER, dst);
+      uint32_t epoch = cmd->sync.epoch;
+      hk_sync_after_alias_flush(cmd, b, dst);
+      T("flush in source stream adds no ordering",
+        cmd->sync.epoch == epoch &&
+        cmd->sync.req[util_logbase2(dst)][HK_SYNC_CDM].cut == b);
+   }
+
+   struct hk_cmd_buffer *cmd = new_cmd();
+   xfer_write(cmd, 0x10000, 0x20000, false);
+   struct hk_cs *b = add(cmd, true);
+   hk_sync_barrier(cmd, HK_SYNC_XFER, HK_SYNC_COMPUTE | HK_SYNC_XFER);
+   uint32_t epoch = cmd->sync.epoch;
+   hk_sync_after_alias_flush(cmd, b, HK_SYNC_COMPUTE | HK_SYNC_XFER);
+   T("CDM destinations add no ordering", cmd->sync.epoch == epoch);
+}
+
 /* G17P transfer writes: only work that may access the written range is
  * ordered after the transfer, everything else keeps its overlap. */
 static void
@@ -1272,6 +1320,7 @@ main(void)
    test_precise_tile_evictions();
    test_direct_single_footprints();
    test_xfer_write_order();
+   test_alias_flush_order();
    test_barrier_chains_without_work();
    test_multiview_layer_preservation();
    test_compute_clear_layer_preservation();

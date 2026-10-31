@@ -1165,6 +1165,12 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    hk_sync_barrier(cmd, src_kinds, dst_kinds);
 
+   /* The open stream may hold unrelated compute work after the source
+    * stream ended. Graphics must wait for its alias flush too, even though
+    * the source-stage dependency alone only reaches the earlier stream. */
+   if (alias_dep && cs && cs->stats.cmds)
+      hk_sync_after_alias_flush(cmd, cs, dst_kinds);
+
    /* A barrier-only command buffer otherwise records no GPU work, so it
     * cannot make a preceding fragment store visible to the host. Emit the
     * native strong CDM cache-maintenance record only when the API requests
