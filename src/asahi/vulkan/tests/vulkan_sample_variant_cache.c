@@ -104,7 +104,7 @@ static void run(double *record_ms, uint64_t *hash) {
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .pNext = &(VkPhysicalDeviceVulkan13Features){
           .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-          .dynamicRendering = VK_TRUE,
+          .dynamicRendering = VK_TRUE, .synchronization2 = VK_TRUE,
           .pNext = &(VkPhysicalDeviceExtendedDynamicState3FeaturesEXT){
               .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT,
               .extendedDynamicState3RasterizationSamples = VK_TRUE}},
