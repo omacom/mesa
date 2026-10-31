@@ -12,9 +12,11 @@
  * The test starts from an empty cache directory and runs the same sequence
  * from two Vulkan instances in turn: create the pipeline, then a sampler with
  * a custom border colour, then record a draw that samples across the border,
- * timing the recording and reading back the image. The second recording must
- * take a fraction of the first and render the same image, with the custom
- * border colour around the texture.
+ * counting the shaders compiled while recording (vulkan_compile_count.h) and
+ * reading back the image. The first recording must build a twin, and the
+ * second must compile nothing and render the same image, with the custom
+ * border colour around the texture. Recording times are printed for
+ * information only.
  *
  * Usage: vulkan-border-emulation-cache   Exit status 0 = pass.
  */
@@ -29,6 +31,7 @@
 #include <vulkan/vulkan.h>
 
 #include "vulkan_border_emulation_cache_shaders.h"
+#include "vulkan_compile_count.h"
 
 #define CHECK(call)                                                            \
   do {                                                                         \
@@ -100,10 +103,10 @@ static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from,
 }
 
 /* One instance: pipeline first, then the custom-border sampler, then the draw.
- * Returns the recording time, a hash of the image and the centre and corner
- * pixels. */
-static void run(double *record_ms, uint64_t *hash, uint32_t *centre,
-                uint32_t *corner) {
+ * Returns the recording time, the number of shaders compiled while recording,
+ * a hash of the image and the centre and corner pixels. */
+static void run(double *record_ms, unsigned *compiles, uint64_t *hash,
+                uint32_t *centre, uint32_t *corner) {
   VkInstance inst;
   CHECK(vkCreateInstance(&(VkInstanceCreateInfo){
       .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -254,7 +257,9 @@ static void run(double *record_ms, uint64_t *hash, uint32_t *centre,
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = cp,
       .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1}, &cb));
 
+  struct compile_count count;
   struct timespec t0, t1;
+  compile_count_begin(&count);
   clock_gettime(CLOCK_MONOTONIC, &t0);
   CHECK(vkBeginCommandBuffer(cb, &(VkCommandBufferBeginInfo){
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}));
@@ -297,6 +302,7 @@ static void run(double *record_ms, uint64_t *hash, uint32_t *centre,
                              .imageExtent = {W, H, 1}});
   CHECK(vkEndCommandBuffer(cb));
   clock_gettime(CLOCK_MONOTONIC, &t1);
+  *compiles = compile_count_end(&count);
   *record_ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
 
   VkFence fence;
@@ -359,14 +365,17 @@ int main(void) {
   }
   setenv("MESA_SHADER_CACHE_DIR", dir, 1);
   unsetenv("MESA_SHADER_CACHE_DISABLE");
+  compile_count_enable();
 
   double first, second;
+  unsigned first_compiles, second_compiles;
   uint64_t h0, h1;
   uint32_t centre, corner;
-  run(&first, &h0, &centre, &corner);
-  run(&second, &h1, &centre, &corner);
-  printf("recording with the emulating twin built: %.2f ms, emulating from "
-         "the start: %.2f ms\n", first, second);
+  run(&first, &first_compiles, &h0, &centre, &corner);
+  run(&second, &second_compiles, &h1, &centre, &corner);
+  printf("recording with the emulating twin built: %u compiles, %.2f ms; "
+         "emulating from the start: %u compiles, %.2f ms\n",
+         first_compiles, first, second_compiles, second);
 
   char cmd[96];
   snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
@@ -382,8 +391,14 @@ int main(void) {
     fprintf(stderr, "FAIL: the second run renders differently\n");
     return 1;
   }
-  if (second * 4 > first) {
-    fprintf(stderr, "FAIL: the second run built an emulating twin again\n");
+  if (first_compiles == 0) {
+    fprintf(stderr, "FAIL: the first recording compiled nothing, so the draw "
+            "no longer builds a twin and this test checks nothing\n");
+    return 1;
+  }
+  if (second_compiles != 0) {
+    fprintf(stderr, "FAIL: the second recording compiled %u shaders: it "
+            "built an emulating twin again\n", second_compiles);
     return 1;
   }
   printf("PASS\n");

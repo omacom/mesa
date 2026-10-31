@@ -9,11 +9,13 @@
  * again.
  *
  * The test starts from an empty cache directory and records the same 2x MSAA
- * draw from two Vulkan instances in turn, timing the command buffer
- * recording and reading back the resolved image. The second recording must
- * take a fraction of the first (it loads the variant) and render the same
- * image. On the M4 Pro: 3.9 ms against 0.56 ms; a driver that compiles the
- * variant again takes 2.7 ms against 1.5 ms.
+ * draw from two Vulkan instances in turn, counting the shaders compiled
+ * while recording (vulkan_compile_count.h) and reading back the resolved
+ * image. The first recording must compile the variant, and the second must
+ * compile nothing (it loads the variant) and render the same image.
+ * Recording times are printed for information only. On the M4 Pro: 3.9 ms
+ * against 0.56 ms; a driver that compiles the variant again takes 2.7 ms
+ * against 1.5 ms.
  *
  * Usage: vulkan-sample-variant-cache   Exit status 0 = pass.
  */
@@ -27,6 +29,7 @@
 #include <unistd.h>
 #include <vulkan/vulkan.h>
 
+#include "vulkan_compile_count.h"
 #include "vulkan_sample_variant_cache_shaders.h"
 
 #define CHECK(call)                                                            \
@@ -90,8 +93,9 @@ static VkShaderModule module(const uint32_t *code, size_t size) {
 }
 
 /* One instance: build the pipeline, record and run the draw, return the
- * recording time and a hash of the resolved image. */
-static void run(double *record_ms, uint64_t *hash) {
+ * recording time, the number of shaders compiled while recording and a hash
+ * of the resolved image. */
+static void run(double *record_ms, unsigned *compiles, uint64_t *hash) {
   VkInstance inst;
   CHECK(vkCreateInstance(&(VkInstanceCreateInfo){
       .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -201,7 +205,9 @@ static void run(double *record_ms, uint64_t *hash) {
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = cp,
       .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1}, &cb));
 
+  struct compile_count count;
   struct timespec t0, t1;
+  compile_count_begin(&count);
   clock_gettime(CLOCK_MONOTONIC, &t0);
   CHECK(vkBeginCommandBuffer(cb, &(VkCommandBufferBeginInfo){
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}));
@@ -253,6 +259,7 @@ static void run(double *record_ms, uint64_t *hash) {
                              .imageExtent = {W, H, 1}});
   CHECK(vkEndCommandBuffer(cb));
   clock_gettime(CLOCK_MONOTONIC, &t1);
+  *compiles = compile_count_end(&count);
   *record_ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
 
   VkFence fence;
@@ -306,13 +313,16 @@ int main(void) {
   }
   setenv("MESA_SHADER_CACHE_DIR", dir, 1);
   unsetenv("MESA_SHADER_CACHE_DISABLE");
+  compile_count_enable();
 
   double cold, warm;
+  unsigned cold_compiles, warm_compiles;
   uint64_t h0, h1;
-  run(&cold, &h0);
-  run(&warm, &h1);
-  printf("recording with the variant compiled: %.2f ms, from the cache: %.2f ms\n",
-         cold, warm);
+  run(&cold, &cold_compiles, &h0);
+  run(&warm, &warm_compiles, &h1);
+  printf("recording with the variant compiled: %u compiles, %.2f ms; "
+         "from the cache: %u compiles, %.2f ms\n",
+         cold_compiles, cold, warm_compiles, warm);
 
   char cmd[96];
   snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
@@ -323,8 +333,14 @@ int main(void) {
     fprintf(stderr, "FAIL: the cached variant renders differently\n");
     return 1;
   }
-  if (warm * 4 > cold) {
-    fprintf(stderr, "FAIL: the second recording compiled the variant again\n");
+  if (cold_compiles == 0) {
+    fprintf(stderr, "FAIL: the first recording compiled nothing, so the draw "
+            "no longer builds a variant and this test checks nothing\n");
+    return 1;
+  }
+  if (warm_compiles != 0) {
+    fprintf(stderr, "FAIL: the second recording compiled %u shaders: the "
+            "variant did not come from the cache\n", warm_compiles);
     return 1;
   }
   printf("PASS\n");
