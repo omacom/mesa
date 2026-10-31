@@ -164,6 +164,9 @@ struct agx_device {
 
    /* vdrm device */
    struct vdrm_device *vdrm;
+   /* virtio: the host's count of failed commands (asahi_shmem::async_error),
+    * NULL if the host doesn't publish it. */
+   const uint32_t *async_errors;
    uint32_t next_blob_id;
 
    /* Device handle */
