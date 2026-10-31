@@ -1154,6 +1154,9 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     * scope (hk_cdm_alias_scope()). */
    struct hk_cs *cs = cmd->current_cs.cs;
    const bool alias_scope = hk_cdm_alias_scope(dev);
+   const bool alias_dep = alias_scope &&
+                          (src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
+                          dst_kinds;
    if (cs && (src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER)) && dst_kinds &&
        hk_cdm_visibility_flush_needed(dev, cs, alias_scope)) {
       hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
@@ -1169,9 +1172,20 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     * The host reads memory, so on G17P the record has memory scope: a strong
     * flush alone leaves the data in the GPU caches, and the end of the
     * command does not reliably write it back before completion is reported
-    * when render work shares the queue. */
-   if ((dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
-       hk_dependency_has_host_read(pDependencyInfo)) {
+    * when render work shares the queue.
+    *
+    * With alias scope, a dependency recorded while no open compute stream
+    * holds work (the first barrier of a command buffer, or one after the
+    * stream ended) has its source work in an earlier stream or command
+    * buffer, which nothing above flushed with memory scope. Record the
+    * flush the same way, and order the destination after that stream: a
+    * reader in the same stream follows the record, a render waits for the
+    * stream. */
+   const bool host_read =
+      (dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
+      hk_dependency_has_host_read(pDependencyInfo);
+   const bool alias_opener = alias_dep && !(cs && cs->stats.cmds);
+   if (host_read || alias_opener) {
       struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
       hk_sync_src_dep(cmd, src_kinds, cmd->current_cs.cs, dep);
 
@@ -1183,6 +1197,8 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
       hk_ensure_cs_has_space(cmd, flush, AGX3_CDM_BARRIER_SIZE);
       hk_cdm_visibility_flush(dev, flush, true);
+      if (alias_opener)
+         hk_sync_after_stream(cmd, flush, dst_kinds);
    }
 
    /* The dependency this barrier recorded is the one a continued instance

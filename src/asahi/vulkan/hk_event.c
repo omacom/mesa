@@ -98,15 +98,22 @@ hk_ResetEvent(VkDevice device, VkEvent _event)
  */
 static void
 hk_event_write(struct hk_cmd_buffer *cmd, struct hk_event *event,
-               uint8_t src_kinds, uint32_t value)
+               uint8_t src_kinds, uint32_t value, bool memory_flush)
 {
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    hk_sync_src_dep(cmd, src_kinds, cmd->current_cs.cs, dep);
 
    cmd->sync.kind_override = HK_SYNC_ALL;
    struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
-   if (cs)
+   if (cs) {
+      /* Source work in an earlier stream or command buffer: the memory-scope
+       * flush goes ahead of the write, in this stream ordered after it. */
+      if (memory_flush) {
+         hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
+         hk_cdm_visibility_flush(hk_cmd_buffer_device(cmd), cs, true);
+      }
       hk_queue_write(cmd, event->bo->va->addr, value, false);
+   }
    cmd->sync.kind_override = 0;
 }
 
@@ -130,13 +137,17 @@ hk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
     * the source writes flushed with memory scope (hk_cdm_alias_scope()). */
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_cs *cs = cmd->current_cs.cs;
-   if (cs && (src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
-       hk_cdm_alias_scope(dev) && hk_cdm_visibility_flush_needed(dev, cs, true)) {
+   const bool alias_dep = (src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
+                          hk_cdm_alias_scope(dev);
+   if (cs && alias_dep && hk_cdm_visibility_flush_needed(dev, cs, true)) {
       hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
       hk_cdm_visibility_flush(dev, cs, true);
    }
 
-   hk_event_write(cmd, event, src_kinds, VK_EVENT_SET);
+   /* No open stream holds the source work (hk_CmdPipelineBarrier2()): the
+    * flush goes into the stream that carries the write. */
+   hk_event_write(cmd, event, src_kinds, VK_EVENT_SET,
+                  alias_dep && !(cs && cs->stats.cmds));
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -148,7 +159,8 @@ hk_CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
    VK_FROM_HANDLE(hk_event, event, _event);
 
    perf_debug(cmd, "Reset event");
-   hk_event_write(cmd, event, hk_sync_kinds_src(stageMask), VK_EVENT_RESET);
+   hk_event_write(cmd, event, hk_sync_kinds_src(stageMask), VK_EVENT_RESET,
+                  false);
 }
 
 /* A wait polls the event word on the GPU, so a later host vkSetEvent is
