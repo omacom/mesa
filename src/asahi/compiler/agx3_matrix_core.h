@@ -46,8 +46,12 @@ struct agx3_matrix_mma8_desc {
    bool discard[3];
    uint8_t wait_mask;
    enum agx3_matrix_input_type input_type;
+   /* B's type when it differs from A's (AGX3B only); 0 means input_type. */
+   enum agx3_matrix_input_type b_input_type;
 };
 
+/* AGX3C: the 14-byte form. AGX3B (G16/G17P): the 12-byte fp32-accumulator
+ * form, fp16 or fp32 A and B. */
 bool agx3_matrix_encode_mma8(enum agx_isa_encoding encoding,
                             const struct agx3_matrix_mma8_desc *desc,
                             uint8_t out[14], uint8_t *length);

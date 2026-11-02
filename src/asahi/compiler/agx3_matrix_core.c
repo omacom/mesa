@@ -1,12 +1,78 @@
 #include "agx3_matrix_core.h"
 #include "agx3_binder.h"
 
+/*
+ * The AGX3B (G16/G17P) 8x8x8 multiply-accumulate with an fp32 accumulator,
+ * the 12-byte f32matmad8x8 form. Field assignments come from Apple's
+ * applegpu_g16g output for MSL simdgroup_float8x8 and simdgroup_half8x8
+ * kernels (metal-tt), whose operand registers are known from the
+ * surrounding loads and stores; see the AGX3BMma8 witnesses.
+ *
+ * Every operand is a register named in 16-bit units, so an even value: D, C
+ * and an fp32 A or B are register pairs, an fp16 A or B (two halves) is one
+ * register. Apple names them all through the register-pair form (25, 42, 59
+ * = 2), which reaches r0..r95, and gives each operand its own type (26, 43,
+ * 60). With c_zero (simdgroup_multiply) the C operand is absent (59 = 1, its
+ * register field zero). The wait mask has six slots here, not eight.
+ */
+static bool
+agx3_matrix_encode_mma8_agx3b(const struct agx3_matrix_mma8_desc *d,
+                              uint8_t out[14], uint8_t *length)
+{
+   unsigned a_type = d->input_type ? d->input_type : AGX3_MATRIX_INPUT_F16;
+   unsigned b_type = d->b_input_type ? d->b_input_type : a_type;
+   if ((a_type != AGX3_MATRIX_INPUT_F16 && a_type != AGX3_MATRIX_INPUT_F32) ||
+       (b_type != AGX3_MATRIX_INPUT_F16 && b_type != AGX3_MATRIX_INPUT_F32) ||
+       (d->dest & 1) || d->dest > 190 || (d->a & 1) || d->a > 190 ||
+       (d->b & 1) || d->b > 190 || d->wait_mask > 0x3f ||
+       (!d->c_zero && ((d->c & 1) || d->c > 190)) ||
+       (d->c_zero && (d->c || d->cache[2] || d->discard[2])))
+      return false;
+
+   for (unsigned i = 0; i < 3; ++i) {
+      if (d->cache[i] && d->discard[i])
+         return false;
+   }
+
+   const struct agx3_field_kv base[] = {
+      {9, 2}, {10, 2}, {25, 2}, {42, 2}, {60, 2},
+   };
+   struct agx3_field_kv fields[21];
+   unsigned count = 0;
+   fields[count++] = (struct agx3_field_kv){26, a_type};
+   fields[count++] = (struct agx3_field_kv){43, b_type};
+   fields[count++] = (struct agx3_field_kv){2, d->dest};
+   fields[count++] = (struct agx3_field_kv){11, d->dest_cache};
+   fields[count++] = (struct agx3_field_kv){18, d->a};
+   fields[count++] = (struct agx3_field_kv){35, d->b};
+   fields[count++] = (struct agx3_field_kv){52, d->c};
+   fields[count++] = (struct agx3_field_kv){59, d->c_zero ? 1 : 2};
+   fields[count++] = (struct agx3_field_kv){27, d->cache[0]};
+   fields[count++] = (struct agx3_field_kv){29, d->discard[0]};
+   fields[count++] = (struct agx3_field_kv){44, d->cache[1]};
+   fields[count++] = (struct agx3_field_kv){46, d->discard[1]};
+   fields[count++] = (struct agx3_field_kv){61, d->cache[2]};
+   fields[count++] = (struct agx3_field_kv){63, d->discard[2]};
+   for (unsigned i = 0; i < 6; ++i)
+      fields[count++] = (struct agx3_field_kv){69 + i,
+                                             (d->wait_mask >> i) & 1};
+
+   return agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "f32matmad8x8", 0, base,
+                            sizeof(base) / sizeof(base[0]), fields, count,
+                            out, length);
+}
+
 bool
 agx3_matrix_encode_mma8(enum agx_isa_encoding encoding,
                         const struct agx3_matrix_mma8_desc *d,
                         uint8_t out[14], uint8_t *length)
 {
-   if (!d)
+   if (!d || !out || !length)
+      return false;
+   if (encoding == AGX_ISA_ENCODING_AGX3B)
+      return agx3_matrix_encode_mma8_agx3b(d, out, length);
+   /* AGX3C takes one input type for A and B. */
+   if (d->b_input_type && d->b_input_type != d->input_type)
       return false;
    unsigned type = d->input_type ? d->input_type : AGX3_MATRIX_INPUT_F16;
    unsigned align_mask = type == AGX3_MATRIX_INPUT_F16 ? 3 : 1;
