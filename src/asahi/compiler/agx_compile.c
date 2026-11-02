@@ -7989,16 +7989,41 @@ agx_guarded_load_arm_ok(nir_block *block)
    return true;
 }
 
-/* The address an arm's load uses when the arm is not taken: the zero page.
+/* The zero-page address a load reads when its arm is not taken. The load
+ * keeps its alignment facts, which later passes (the load/store vectorizer)
+ * rely on, so they must hold for this address too. AGX_ZERO_PAGE_ADDRESS is
+ * 4 GiB aligned, a multiple of any align_mul, so the page base plus
+ * align_offset satisfies them and the read stays inside the page. If it
+ * would not, weaken the facts to what the page base satisfies: the largest
+ * power of two dividing align_offset, offset 0.
+ */
+static uint64_t
+agx_guarded_fallback(nir_intrinsic_instr *intr, unsigned *align_mul,
+                     unsigned *align_offset)
+{
+   STATIC_ASSERT((AGX_ZERO_PAGE_ADDRESS & ((1ull << 32) - 1)) == 0);
+   const unsigned bytes = intr->def.num_components * intr->def.bit_size / 8;
+   *align_mul = nir_intrinsic_align_mul(intr);
+   *align_offset = nir_intrinsic_align_offset(intr);
+
+   if (*align_offset + bytes <= AGX_ZERO_PAGE_SIZE)
+      return AGX_ZERO_PAGE_ADDRESS + *align_offset;
+
+   *align_mul = *align_offset & -*align_offset;
+   *align_offset = 0;
+   return AGX_ZERO_PAGE_ADDRESS;
+}
+
+/* The address an arm's load uses: `fallback` when the arm is not taken.
  * Keep the base + 32-bit index shape agx_nir_lower_address folds into the
  * load, selecting the base and the unscaled index rather than the 64-bit
- * sum: zero page + 0.
+ * sum: fallback + 0.
  */
 static nir_def *
 agx_guarded_address(nir_builder *b, nir_def *addr, nir_def *cond,
-                    bool taken_if_true)
+                    bool taken_if_true, uint64_t fallback)
 {
-   nir_def *zero_page = nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS);
+   nir_def *fallback_addr = nir_imm_int64(b, fallback);
 #define AGX_GUARD(taken, other)                                                \
    (taken_if_true ? nir_bcsel(b, cond, taken, other)                          \
                   : nir_bcsel(b, cond, other, taken))
@@ -8025,12 +8050,12 @@ agx_guarded_address(nir_builder *b, nir_def *addr, nir_def *cond,
          } else {
             guarded = AGX_GUARD(index, zero);
          }
-         return nir_iadd(b, AGX_GUARD(base, zero_page),
+         return nir_iadd(b, AGX_GUARD(base, fallback_addr),
                          nir_build_alu1(b, cvt->op, guarded));
       }
    }
 
-   return AGX_GUARD(addr, zero_page);
+   return AGX_GUARD(addr, fallback_addr);
 #undef AGX_GUARD
 }
 
@@ -8052,12 +8077,17 @@ agx_redirect_arm_loads(nir_block *block, nir_def *cond, bool taken_if_true)
 
       nir_builder b = nir_builder_at(nir_before_instr(instr));
       nir_def *addr = intr->src[0].ssa;
-      if (!(access & ACCESS_CAN_SPECULATE))
-         addr = agx_guarded_address(&b, addr, cond, taken_if_true);
+      unsigned align_mul = nir_intrinsic_align_mul(intr);
+      unsigned align_offset = nir_intrinsic_align_offset(intr);
+      if (!(access & ACCESS_CAN_SPECULATE)) {
+         const uint64_t fallback =
+            agx_guarded_fallback(intr, &align_mul, &align_offset);
+         addr = agx_guarded_address(&b, addr, cond, taken_if_true, fallback);
+      }
       nir_def *value = nir_load_global_constant(
          &b, intr->def.num_components, intr->def.bit_size, addr,
-         .align_mul = nir_intrinsic_align_mul(intr),
-         .align_offset = nir_intrinsic_align_offset(intr),
+         .align_mul = align_mul,
+         .align_offset = align_offset,
          .access = access | ACCESS_CAN_SPECULATE);
       nir_def_replace(&intr->def, value);
       loads = true;
