@@ -71,10 +71,11 @@ agx3_matrix_encode_mma8(enum agx_isa_encoding encoding,
       return false;
    if (encoding == AGX_ISA_ENCODING_AGX3B)
       return agx3_matrix_encode_mma8_agx3b(d, out, length);
-   /* AGX3C takes one input type for A and B. */
-   if (d->b_input_type && d->b_input_type != d->input_type)
-      return false;
+   /* AGX3C takes one input type for A and B. Compare B against A's type
+    * after A's 0 has defaulted to fp16. */
    unsigned type = d->input_type ? d->input_type : AGX3_MATRIX_INPUT_F16;
+   if (d->b_input_type && d->b_input_type != type)
+      return false;
    unsigned align_mask = type == AGX3_MATRIX_INPUT_F16 ? 3 : 1;
    unsigned source_max = type == AGX3_MATRIX_INPUT_F32 ? 252 : 254;
    if (encoding != AGX_ISA_ENCODING_AGX3C || !out || !length ||

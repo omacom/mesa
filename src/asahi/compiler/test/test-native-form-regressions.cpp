@@ -5327,6 +5327,27 @@ TEST(NativeForms, AGX3BMma8MetalWitnesses)
    d.input_type = AGX3_MATRIX_INPUT_F16;
    d.b_input_type = AGX3_MATRIX_INPUT_F32;
    EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+
+   /* ...but naming B's type explicitly, equal to A's, is the same
+    * instruction, including when A's type is the default 0 (fp16). */
+   uint8_t plain[14], plain_length;
+   for (agx3_matrix_input_type a : {(agx3_matrix_input_type)0,
+                                    AGX3_MATRIX_INPUT_F16,
+                                    AGX3_MATRIX_INPUT_F32}) {
+      SCOPED_TRACE(a);
+      d.input_type = a;
+      d.b_input_type = (agx3_matrix_input_type)0;
+      ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3C, &d, plain,
+                                          &plain_length));
+      d.b_input_type = a ? a : AGX3_MATRIX_INPUT_F16;
+      ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3C, &d, bytes,
+                                          &length));
+      EXPECT_EQ(std::vector<uint8_t>(bytes, bytes + length),
+                std::vector<uint8_t>(plain, plain + plain_length));
+   }
+   d.input_type = (agx3_matrix_input_type)0;
+   d.b_input_type = AGX3_MATRIX_INPUT_F32;
+   EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
 }
 
 TEST(NativeForms, M5GemmMixedOperandExecutionWitnesses)
