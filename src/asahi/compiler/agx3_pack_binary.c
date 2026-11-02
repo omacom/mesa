@@ -10219,7 +10219,11 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          if (I->op == AGX_OPCODE_MATMAD8_AGX3) {
             if ((I->matrix_type & 15) != ((I->matrix_type >> 4) & 15))
                AGX3_REFUSE(I);
-            if (enc != AGX_ISA_ENCODING_AGX3C || ctx->is_preamble ||
+            /* AGX3B: the 12-byte f32matmad8x8 (fp16 or fp32 A and B, six
+             * wait slots); agx3_matrix_encode_mma8 refuses other types. */
+            if ((enc != AGX_ISA_ENCODING_AGX3C &&
+                 enc != AGX_ISA_ENCODING_AGX3B) ||
+                ctx->is_preamble ||
                 ctx->stage != MESA_SHADER_COMPUTE || I->nr_dests != 1 ||
                 I->nr_srcs != 3 || I->saturate || wait > 0xff ||
                 !agx3_src_is_register(I->dest[0]) || I->dest[0].memory ||
@@ -10232,9 +10236,12 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                .a = I->src[0].value,
                .b = I->src[1].value,
                .c = I->src[2].value,
-               .dest_cache = I->dest[0].cache,
+               /* None of the G16 witnesses sets D's cache hint; leave it
+                * clear there. */
+               .dest_cache = enc == AGX_ISA_ENCODING_AGX3C && I->dest[0].cache,
                .wait_mask = wait,
                .input_type = I->matrix_type & 15,
+               .b_input_type = (I->matrix_type >> 4) & 15,
             };
             for (unsigned s = 0; s < 3; ++s) {
                const agx_index src = I->src[s];

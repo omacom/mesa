@@ -1951,10 +1951,13 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       supported_extensions.KHR_pipeline_library = native_rt;
    }
    supported_extensions.KHR_cooperative_matrix =
-      agx_chip_g17_m5(pdev->dev.chip) &&
-      debug_get_bool_option("ASAHI_M5_COOPERATIVE_MATRIX", true);
+      (agx_chip_g17_m5(pdev->dev.chip) &&
+       debug_get_bool_option("ASAHI_M5_COOPERATIVE_MATRIX", true)) ||
+      hk_agx3b_cooperative_matrix(&pdev->dev);
 
+   /* AGX3B has no bfloat16 matrix form. */
    supported_extensions.KHR_shader_bfloat16 =
+      agx_chip_g17_m5(pdev->dev.chip) &&
       supported_extensions.KHR_cooperative_matrix &&
       debug_get_bool_option("ASAHI_M5_BFLOAT16", true);
 
@@ -2393,7 +2396,9 @@ hk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
             .scope = VK_SCOPE_SUBGROUP_KHR,
          };
       }
-      unsigned max_size = (pdev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_MATRIX) ? 16 : 8;
+      /* 16x16 is the M5 kernel-gated form; AGX3B has only 8x8x8. */
+      unsigned max_size = agx_chip_g17_m5(pdev->dev.chip) &&
+         (pdev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_MATRIX) ? 16 : 8;
       for (unsigned size = max_size; size >= 8; size /= 2) {
          const VkComponentTypeKHR types[] = {VK_COMPONENT_TYPE_FLOAT16_KHR,
             VK_COMPONENT_TYPE_BFLOAT16_KHR};

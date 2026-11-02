@@ -9,6 +9,7 @@
 
 #include "asahi/lib/agx_device.h"
 #include <sys/types.h>
+#include "util/u_debug.h"
 #include "hk_private.h"
 #include "vk_physical_device.h"
 #include "vk_sync.h"
@@ -101,6 +102,18 @@ static inline struct hk_instance *
 hk_physical_device_instance(struct hk_physical_device *pdev)
 {
    return (struct hk_instance *)pdev->vk.instance;
+}
+
+/* VK_KHR_cooperative_matrix through the AGX3B f32matmad8x8: 8x8x8 with fp16
+ * or fp32 A and B and an fp32 accumulator. The encoding comes from G16G
+ * (M4) Metal output, and G17P shares the AGX3B table, but it has not run on
+ * an AGX3B GPU with this driver, so it stays opt-in
+ * (ASAHI_AGX3B_COOPERATIVE_MATRIX=1) until it has. */
+static inline bool
+hk_agx3b_cooperative_matrix(const struct agx_device *dev)
+{
+   return (dev->chip == AGX_CHIP_G17P || dev->chip == AGX_CHIP_G16G) &&
+          debug_get_bool_option("ASAHI_AGX3B_COOPERATIVE_MATRIX", false);
 }
 
 VkResult hk_create_drm_physical_device(struct vk_instance *vk_instance,

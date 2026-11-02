@@ -2796,7 +2796,9 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
          ? AGX3_MATRIX_INPUT_BF16 : nir_intrinsic_src_type2(instr) == nir_type_float32
          ? AGX3_MATRIX_INPUT_F32 : AGX3_MATRIX_INPUT_F16;
       type |= type_b << 4;
-      assert(b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+      /* AGX3C has the 8x8 and 16x16 forms. AGX3B packs only the 8x8 form,
+       * with fp16 or fp32 A and B; the packer refuses anything else. */
+      assert(b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2 &&
              stage == MESA_SHADER_COMPUTE && !b->shader->is_preamble);
       if (instr->def.num_components == 8) {
          agx_matmad16_agx3_to(b, dst, agx_src_index(&instr->src[0]),
