@@ -276,6 +276,28 @@ agx_chip_driver_supported(enum agx_chip chip)
    }
 }
 
+/* Measured J514M/T6034 G15C B1: four ten-slot clusters with 30 fused cores.
+ * Keep this separate from the existing T6031 contract. Every consumer uses
+ * the supplied masks; a different revision or topology needs its own evidence.
+ */
+static bool
+agx_params_t6034_supported(const struct drm_asahi_params_global *params)
+{
+   if (params->chip_id != 0x6034 || params->gpu_revision != 0x11 ||
+       params->num_cores_per_cluster != 10)
+      return false;
+
+   unsigned enabled = 0;
+   for (unsigned i = 0; i < 4; ++i) {
+      uint64_t mask = params->core_masks[i];
+      if (!mask || (mask & ~UINT64_C(0x3ff)))
+         return false;
+      for (; mask; mask &= mask - 1)
+         ++enabled;
+   }
+   return enabled == 30;
+}
+
 bool
 agx_params_driver_supported(const struct drm_asahi_params_global *params)
 {
@@ -316,10 +338,11 @@ agx_params_driver_supported(const struct drm_asahi_params_global *params)
              params->usc_generation == AGX_ISA_AGX3 &&
              params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_LEGACY;
    case AGX_CHIP_G15C:
-      /* T6031/M3 Max: the same generation as T6030 with four clusters.
-       * Binned parts differ only in their core masks, which every consumer
-       * reads from the parameters, so the masks are not part of the check. */
-      return params->chip_id == 0x6031 && params->num_dies == 1 &&
+      /* T6031 and the measured 30-core T6034 use the four-cluster G15C
+       * contract. T6034 additionally requires its measured revision and
+       * fused topology; the existing T6031 admission is unchanged. */
+      return (params->chip_id == 0x6031 || agx_params_t6034_supported(params)) &&
+             params->num_dies == 1 &&
              params->num_clusters_total == 4 &&
              params->usc_generation == AGX_ISA_AGX3 &&
              params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_LEGACY;

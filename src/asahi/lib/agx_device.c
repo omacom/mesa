@@ -976,7 +976,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
          fprintf(stderr,
                  "Apple G15C kernel parameters do not match this driver "
                  "(chip %#x, %u dies, %u clusters, USC %u, HAL %u; expected "
-                 "chip 0x6031, 1 die, 4 clusters, USC 3, HAL 0)\n",
+                 "chip 0x6031 or 30-core T6034 B1, 1 die, 4 clusters, USC 3, HAL 0)\n",
                  dev->params.chip_id, dev->params.num_dies,
                  dev->params.num_clusters_total, dev->params.usc_generation,
                  dev->params.gpu_hal_generation);
