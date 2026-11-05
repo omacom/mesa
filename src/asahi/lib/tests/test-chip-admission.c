@@ -119,6 +119,39 @@ main(void)
    bad.num_clusters_total = 4;
    assert(!agx_params_driver_supported(&bad));
 
+   /* Fresh J514M/T6034 identity: four physical clusters, 30 enabled cores. */
+   struct drm_asahi_params_global t6034 = g15_params('C', 0x6034, 4);
+   t6034.gpu_revision = 0x11;
+   t6034.core_masks[0] = t6034.core_masks[1] = 0x1fd;
+   t6034.core_masks[2] = t6034.core_masks[3] = 0x1ed;
+   assert(agx_params_driver_supported(&t6034));
+   bad = t6034; bad.chip_id = 0x6032;
+   assert(!agx_params_driver_supported(&bad));
+   bad = t6034; bad.gpu_revision = 0x12;
+   assert(!agx_params_driver_supported(&bad));
+   bad = t6034; bad.num_cores_per_cluster = 8;
+   assert(!agx_params_driver_supported(&bad));
+   bad = t6034; bad.num_clusters_total = 3;
+   assert(!agx_params_driver_supported(&bad));
+   bad = t6034; bad.num_dies = 2;
+   assert(!agx_params_driver_supported(&bad));
+   bad = t6034; bad.usc_generation = 2;
+   assert(!agx_params_driver_supported(&bad));
+   bad = t6034; bad.gpu_hal_generation = DRM_ASAHI_GPU_HAL_200;
+   assert(!agx_params_driver_supported(&bad));
+   bad = t6034; bad.core_masks[0] |= UINT64_C(1) << 10;
+   assert(!agx_params_driver_supported(&bad));
+   bad = t6034; bad.core_masks[0] = 0;
+   assert(!agx_params_driver_supported(&bad));
+   bad = t6034; bad.core_masks[0] ^= 1;
+   assert(!agx_params_driver_supported(&bad));
+   bad = t6034; bad.core_masks[0] |= 2;
+   assert(!agx_params_driver_supported(&bad));
+   assert(!agx_params_native_kernel_abi_supported(&t6034));
+   t6034.features = DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS |
+                    DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS;
+   assert(agx_params_native_kernel_abi_supported(&t6034));
+
    /* The same GPU identity must not admit the incompatible legacy payloads. */
    assert(!agx_params_native_kernel_abi_supported(NULL));
    assert(!agx_params_native_kernel_abi_supported(&g15s));
