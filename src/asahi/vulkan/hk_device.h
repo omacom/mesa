@@ -365,23 +365,22 @@ enum hk_perftest {
  * and only when that stream already holds work
  * (hk_cdm_visibility_flush_needed()). It writes back every dirty line, so
  * the writes it covers include those of earlier streams and earlier
- * command buffers. A barrier recorded with no open compute stream holding
- * work records no flush. This includes the first barrier of a command
- * buffer and barriers after the stream was closed, for example by a
- * timestamp or query copy. Earlier writes read through another address
- * after such a barrier have no memory-scope flush between them. Whether
- * the hardware returns stale data in that case has not been tested. When
- * the open stream holds work unrelated to the source, the flush goes at its
- * end, but a graphics destination is still ordered only after the source's
- * stream, so it can start before the flush. Not covered: a
- * resource created after the command buffer was recorded and reached
- * through a path recording did not see, that is a device address the
- * command buffer reads indirectly, or a descriptor set bound at recording
- * and updated after it (descriptorBinding*UpdateAfterBind). Graphics-only
- * sources also do not request memory scope: attachment or shader writes
- * through a sparse image followed by transfer or compute reads through a
- * plain alias receive the ordinary post-graphics strong flush. That case
- * has not been hardware-tested. */
+ * command buffers. When no open compute stream holds work, including after
+ * a timestamp or query copy closed it partway through a command buffer,
+ * hk_CmdPipelineBarrier2() and hk_CmdSetEvent2() record the flush into a
+ * stream ordered after the source scope, as a host-read dependency does,
+ * and order the destination after that stream. When the open stream holds
+ * work unrelated to the source, the flush goes at its end and a graphics
+ * destination is ordered after that stream too (hk_sync_after_alias_flush()).
+ * That the hardware writes those earlier lines back from a flush in a later
+ * stream has not been tested. Not covered: a resource created after the command
+ * buffer was recorded and reached through a path recording did not see, that is
+ * a device address the command buffer reads indirectly, or a descriptor set
+ * bound at recording and updated after it (descriptorBinding*UpdateAfterBind).
+ * Graphics-only sources also do not request memory scope: attachment or
+ * shader writes through a sparse image followed by transfer or compute
+ * reads through a plain alias receive the ordinary post-graphics strong
+ * flush. That case has not been hardware-tested. */
 static inline bool
 hk_cdm_alias_scope(const struct hk_device *dev)
 {

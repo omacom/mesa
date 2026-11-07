@@ -405,6 +405,11 @@ void hk_sync_note_memory_write(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 void hk_sync_after_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                           uint8_t dst_kinds);
 
+/* After recording a memory-scope alias flush, extend only graphics
+ * requirements that do not already include the stream carrying it. */
+void hk_sync_after_alias_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                               uint8_t dst_kinds);
+
 /* Hooks from the control-stream machinery. */
 void hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                             struct hk_cs **slot, bool compute);

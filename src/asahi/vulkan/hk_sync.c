@@ -694,6 +694,26 @@ hk_sync_after_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    cmd->sync.epoch++;
 }
 
+void
+hk_sync_after_alias_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                          uint8_t dst_kinds)
+{
+   assert(cs->type == HK_CS_CDM);
+   /* Compute and transfer readers follow the flush on the CDM subqueue.
+    * A source cut at this stream (or a later one) already orders graphics
+    * after it; preserve that requirement without adding another edge. */
+   uint8_t after = 0;
+   u_foreach_bit(d, dst_kinds & (HK_SYNC_GFX | HK_SYNC_GFX_FRAG |
+                               HK_SYNC_GFX_IMG)) {
+      struct hk_cs *cut = cmd->sync.req[d][HK_SYNC_CDM].cut;
+      if (!cut || cut->sync.seq < cs->sync.seq)
+         after |= BITFIELD_BIT(d);
+   }
+
+   if (after)
+      hk_sync_after_stream(cmd, cs, after);
+}
+
 static uint8_t
 stream_kind(struct hk_cmd_buffer *cmd, struct hk_cs **slot, bool compute)
 {
