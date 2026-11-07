@@ -499,9 +499,11 @@ hk_cmd_pool_free_bo_list(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
                          struct list_head *bos)
 {
    const struct hk_device *dev = hk_cmd_pool_device(pool);
+   /* Under virtio every BO is an external object, which the host kernel locks
+    * on every submit: a pool hoarding hundreds of idle BOs slows all submits. */
    const unsigned max_free =
       (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
-         type == HK_CMD_BO_MAIN
+         type == HK_CMD_BO_MAIN && !dev->dev.is_virtio
          ? HK_G17P_CMD_POOL_MAIN_BO_MAX
          : HK_CMD_POOL_BO_MAX;
 

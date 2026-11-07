@@ -1945,11 +1945,9 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
 
    enum drm_asahi_priority priority = DRM_ASAHI_PRIORITY_MEDIUM;
 
-   if (flags & PIPE_CONTEXT_PRIORITY_LOW)
+   if (flags & PIPE_CONTEXT_LOW_PRIORITY)
       priority = DRM_ASAHI_PRIORITY_LOW;
-   else if (flags & PIPE_CONTEXT_PRIORITY_MEDIUM)
-      priority = DRM_ASAHI_PRIORITY_MEDIUM;
-   else if (flags & (PIPE_CONTEXT_PRIORITY_HIGH | PIPE_CONTEXT_PRIORITY_REALTIME))
+   else if (flags & (PIPE_CONTEXT_HIGH_PRIORITY | PIPE_CONTEXT_REALTIME_PRIORITY))
       priority = DRM_ASAHI_PRIORITY_HIGH;
 
    ctx->queue_id = agx_create_command_queue(agx_device(screen), priority);

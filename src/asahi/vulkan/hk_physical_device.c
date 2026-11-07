@@ -14,6 +14,7 @@
 #include "util/disk_cache.h"
 #include "util/hex.h"
 #include "util/mesa-blake3.h"
+#include "util/u_process.h"
 #include "util/os_misc.h"
 #include "git_sha1.h"
 #include "hk_buffer.h"
@@ -1701,6 +1702,63 @@ hk_codegen_env_hash(void)
    return h;
 }
 
+/* Whether a program's shaders emulate custom border colours is decided at
+ * the first sampler that needs it (hk_sampler.c), which lands at a different
+ * point among the shaders compiled on worker threads each time the program
+ * runs. Shaders compiled before it leave the emulation out and need an
+ * emulating twin, built on the draw that binds them, and the shader cache key
+ * carries the setting, so a run that met the sampler at another point missed
+ * the cache. Remember in the disk cache that this program needed it, so its
+ * next run emulates from the start. The emulation is a branch on the bound
+ * sampler, correct with or without a custom border. */
+static bool
+hk_border_emulation_key(struct hk_physical_device *pdev, cache_key key)
+{
+#ifdef ENABLE_SHADER_CACHE
+   if (!pdev->vk.disk_cache)
+      return false;
+   static const char tag[] = "hk border emulation";
+   const char *process = util_get_process_name();
+   struct mesa_blake3 ctx;
+   blake3_hash hash;
+   _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, tag, sizeof(tag));
+   if (process)
+      _mesa_blake3_update(&ctx, process, strlen(process));
+   _mesa_blake3_final(&ctx, hash);
+   disk_cache_compute_key(pdev->vk.disk_cache, hash, sizeof(hash), key);
+   return true;
+#else
+   return false;
+#endif
+}
+
+void
+hk_border_emulation_recall(struct hk_physical_device *pdev)
+{
+#ifdef ENABLE_SHADER_CACHE
+   cache_key key;
+   size_t size;
+   if (!hk_border_emulation_key(pdev, key))
+      return;
+   void *seen = disk_cache_get(pdev->vk.disk_cache, key, &size);
+   if (seen)
+      p_atomic_set(&pdev->border_emulation, 1);
+   free(seen);
+#endif
+}
+
+void
+hk_border_emulation_remember(struct hk_physical_device *pdev)
+{
+#ifdef ENABLE_SHADER_CACHE
+   static const uint8_t seen = 1;
+   cache_key key;
+   if (hk_border_emulation_key(pdev, key))
+      disk_cache_put(pdev->vk.disk_cache, key, &seen, sizeof(seen), NULL);
+#endif
+}
+
 static void
 hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
 {
@@ -1747,6 +1805,7 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
    pdev->vk.disk_cache = disk_cache_create(renderer, timestamp, driver_flags ^
       (env_hash * UINT64_C(0xff51afd7ed558ccd)));
    if (pdev->vk.disk_cache != NULL) {
+      hk_border_emulation_recall(pdev);
       pdev->vk.properties.pipelineBinaryInternalCache = true;
       pdev->vk.properties.pipelineBinaryInternalCacheControl = true;
       pdev->vk.properties.pipelineBinaryPrefersInternalCache = true;

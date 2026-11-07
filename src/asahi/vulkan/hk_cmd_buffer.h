@@ -1296,6 +1296,11 @@ struct hk_cs {
    /* Remaining state is for graphics only, ignored for compute */
    struct agx_tilebuffer_layout tib;
 
+   /* Bottom-right corner of the render area, or 0 where it is not known (a
+    * secondary command buffer continuing a render pass). Tiles past it hold
+    * nothing the render may change, so the render need not visit them. */
+   uint32_t area_x1, area_y1;
+
    struct util_dynarray scissor, depth_bias;
    uint64_t uploaded_scissor, uploaded_zbias;
 

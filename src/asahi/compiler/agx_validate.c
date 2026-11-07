@@ -488,6 +488,11 @@ agx_read_registers(const agx_context *ctx, const agx_instr *I, unsigned s)
           * its existing compare/offset collect. */
          return agx_is_null(I->src[s]) ? 0
                                       : 2 * agx_channels(I->src[s]);
+      } else if (s == 6 && I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
+                 I->nr_srcs == 7) {
+         /* A cube sample's own CEM scratch (agx3_reserve_cube_scratch): the
+          * four words the packer computes CEM in. */
+         return 8;
       } else {
          return size;
       }

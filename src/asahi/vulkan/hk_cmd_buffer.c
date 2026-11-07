@@ -3835,6 +3835,8 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    }
 
    cs->tib = render->tilebuffer;
+   cs->area_x1 = render->area.offset.x + render->area.extent.width;
+   cs->area_y1 = render->area.offset.y + render->area.extent.height;
    /* Attachmentless rendering defers its API sample count. Publish the
     * native one-sample no-imageblock profile in this control stream while
     * preserving the deferred count in render state. */

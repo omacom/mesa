@@ -245,6 +245,9 @@ struct hk_device {
       int32_t *word;
    } vm_status_mirror;
 
+   /* virtio: dev->dev.async_errors when the device was created. */
+   uint32_t async_errors_base;
+
    struct {
       /* Immutable for the device's lifetime: the native texel-fetch sampler
        * table. Its address is published to the GPU as a sampler table base by
