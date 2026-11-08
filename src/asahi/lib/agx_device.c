@@ -933,8 +933,15 @@ agx_open_device(void *memctx, struct agx_device *dev)
 
    uint64_t normalized_features;
    dev->g15_legacy_wire = false;
-   if (!dev->is_virtio &&
-       agx_g15_wire_features(&dev->params, &normalized_features)) {
+   if (agx_g15_wire_features(&dev->params, &normalized_features)) {
+      /* Under virtio the host renderer forwards GET_PARAMS and SUBMIT to the
+       * same retained G15 kernel, so the guest needs the same feature
+       * normalization and packet translation. virglrenderer only forwards
+       * param group 0, and the VM status paths issue raw asahi ioctls on the
+       * guest fd, so the guest must not advertise them. */
+      if (dev->is_virtio)
+         normalized_features &= ~(uint64_t)(DRM_ASAHI_FEATURE_VM_STATUS |
+                                            DRM_ASAHI_FEATURE_VM_STATUS_MIRROR);
       dev->g15_legacy_wire = true;
       dev->params.features = normalized_features;
    }

@@ -4,7 +4,9 @@
  */
 
 #include "agx_device_virtio.h"
+#include "agx_g15_wire.h"
 
+#include <errno.h>
 #include <inttypes.h>
 #include <sys/mman.h>
 
@@ -240,6 +242,10 @@ agx_virtio_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
 
    struct asahi_ccmd_submit_req *req =
       (struct asahi_ccmd_submit_req *)calloc(1, req_len);
+   if (!req) {
+      errno = ENOMEM;
+      return -1;
+   }
 
    req->queue_id = submit->queue_id;
    req->extres_count = virt->extres_count;
@@ -247,7 +253,22 @@ agx_virtio_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
 
    char *ptr = (char *)&req->payload;
 
-   memcpy(ptr, (void *)(uintptr_t)submit->cmdbuf, req->cmdbuf_size);
+   if (dev->g15_legacy_wire) {
+      /* The retained G15 wire is never larger than the canonical input, so
+       * translate straight into the request and shrink it to fit. */
+      size_t packed;
+      if (!agx_g15_wire_pack((void *)(uintptr_t)submit->cmdbuf,
+                             submit->cmdbuf_size, ptr, submit->cmdbuf_size,
+                             &packed)) {
+         free(req);
+         errno = EINVAL;
+         return -1;
+      }
+      req->cmdbuf_size = packed;
+      req_len = sizeof(struct asahi_ccmd_submit_req) + packed + extres_size;
+   } else {
+      memcpy(ptr, (void *)(uintptr_t)submit->cmdbuf, req->cmdbuf_size);
+   }
    ptr += req->cmdbuf_size;
 
    memcpy(ptr, virt->extres, extres_size);
