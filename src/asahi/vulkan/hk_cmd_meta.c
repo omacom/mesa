@@ -100,6 +100,7 @@ hk_meta_begin(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
 {
    struct hk_descriptor_state *desc = hk_get_descriptors_state(cmd, bind_point);
 
+   hk_cmd_buffer_untrack_cdm(cmd);
    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
       save->dynamic = cmd->vk.dynamic_graphics_state;
       save->_dynamic_vi = cmd->state.gfx._dynamic_vi;
@@ -1359,6 +1360,12 @@ hk_meta_resolve_rendering(struct hk_cmd_buffer *cmd,
    hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
 }
 
+/* Buffer copies, updates and fills launch with no internal barrier. The
+ * application orders them against other work with vkCmdPipelineBarrier, which
+ * flushes before the next CDM launch (cdm_barrier_pending). AGX_BARRIER_ALL
+ * would add a flush before and after each launch, ordering work that Vulkan
+ * leaves unordered.
+ */
 static void
 hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
 {
@@ -1370,7 +1377,7 @@ hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
       unsigned uint4s = size / 16;
       unsigned bytes = uint4s * 16;
 
-      libagx_copy_uint4(cmd, agx_1d(uint4s), AGX_BARRIER_ALL, dst, src);
+      libagx_copy_uint4(cmd, agx_1d(uint4s), AGX_BARRIER_NONE, dst, src);
 
       dst += bytes;
       src += bytes;
@@ -1378,7 +1385,7 @@ hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
    }
 
    if (size) {
-      libagx_copy_uchar(cmd, agx_1d(size), AGX_BARRIER_ALL, dst, src);
+      libagx_copy_uchar(cmd, agx_1d(size), AGX_BARRIER_NONE, dst, src);
    }
 }
 
@@ -1494,10 +1501,10 @@ hk_CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
       vk_meta_buffer_address(&dev->vk, dstBuffer, dstOffset, dstRange);
 
    if (util_is_aligned(addr, 16) && util_is_aligned(range, 16)) {
-      libagx_fill_uint4(cmd, agx_2d(range / 16, 1), AGX_BARRIER_ALL,
+      libagx_fill_uint4(cmd, agx_2d(range / 16, 1), AGX_BARRIER_NONE,
                         addr, 0, data, data, data, data);
    } else {
-      libagx_fill(cmd, agx_1d(range / 4), AGX_BARRIER_ALL, addr, data);
+      libagx_fill(cmd, agx_1d(range / 4), AGX_BARRIER_NONE, addr, data);
    }
 }
 
