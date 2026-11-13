@@ -514,21 +514,31 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
     * afterwards silently does nothing: there is no function_temp array left to
     * move, and nir_opt_large_constants only ever looks at function_temp
     * (nir_opt_large_constants.c:545-561).
+    *
+    * The AGX2 chips take the vertex and fragment branch as well.  Their
+    * backend can encode scratch, but scratch is private to one invocation, so
+    * the shader stores the whole table there before it reads a single entry.
+    * lower_load_constant and hk_flush_shaders() already serve vertex and
+    * fragment blobs on every chip.  AGX2 compute is left as it was: the
+    * classic dispatch path publishes no cs.constant_data_addr.
     */
-   if (agx_native_graphics(&((struct hk_physical_device *)vk_pdev)->dev) ||
-       agx_chip_g17_m5(((struct hk_physical_device *)vk_pdev)->dev.chip)) {
-      if (nir->info.stage == MESA_SHADER_COMPUTE) {
+   const bool native_constants =
+      agx_native_graphics(&((struct hk_physical_device *)vk_pdev)->dev) ||
+      agx_chip_g17_m5(((struct hk_physical_device *)vk_pdev)->dev.chip);
+
+   if (nir->info.stage == MESA_SHADER_COMPUTE) {
+      if (native_constants) {
          NIR_PASS(_, nir, nir_opt_large_constants, NULL, 32);
-      } else if ((nir->info.stage == MESA_SHADER_VERTEX ||
-                  nir->info.stage == MESA_SHADER_FRAGMENT) &&
-                 hk_has_scratch_sized_array(nir)) {
-         /* Vertex and fragment arrays within the scratch threshold keep their
-          * csel ladders, so leave shaders without a larger array untouched.
-          * nir_opt_large_constants cannot lower a whole-array copy_deref. */
-         NIR_PASS(_, nir, nir_lower_var_copies);
-         NIR_PASS(_, nir, nir_opt_large_constants, NULL,
-                  AGX_SCRATCH_ARRAY_THRESHOLD_B);
       }
+   } else if ((nir->info.stage == MESA_SHADER_VERTEX ||
+               nir->info.stage == MESA_SHADER_FRAGMENT) &&
+              hk_has_scratch_sized_array(nir)) {
+      /* Vertex and fragment arrays within the scratch threshold keep their
+       * csel ladders, so leave shaders without a larger array untouched.
+       * nir_opt_large_constants cannot lower a whole-array copy_deref. */
+      NIR_PASS(_, nir, nir_lower_var_copies);
+      NIR_PASS(_, nir, nir_opt_large_constants, NULL,
+               AGX_SCRATCH_ARRAY_THRESHOLD_B);
    }
 
    /* Optimize but allow copies because we haven't lowered them yet */
