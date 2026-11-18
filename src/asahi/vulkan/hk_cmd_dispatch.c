@@ -573,7 +573,26 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
 
    switch (agx_chip_command_stream_generation(dev->dev.chip)) {
    case AGX_CS_GENERATION_AGX2:
-      cs->current = agx_cdm_barrier(cs->current, dev->dev.chip);
+      if (unlikely(dev->cdm_barrier_mask)) {
+         /* Perftest only: exact CDM_BARRIER flag word from the environment. */
+         uint32_t *word = cs->current;
+         *word = dev->cdm_barrier_mask | (AGX_CDM_BLOCK_TYPE_BARRIER << 29);
+         cs->current = word + 1;
+      } else if (HK_PERF(dev, NOCDMBARRIER)) {
+         /* Perftest only: launch with no cache maintenance at all. */
+         return;
+      } else if (HK_PERF(dev, DESIGNEDUSCCDMBARRIER)) {
+         /* Perftest only: designed set {4,5,6,8} + USC cache invalidate. */
+         cs->current = agx_cdm_barrier_designed_usc(cs->current);
+      } else if (HK_PERF(dev, USCCDMBARRIER)) {
+         /* Perftest only: keep the USC cache invalidate, drop the rest. */
+         cs->current = agx_cdm_barrier_usc(cs->current);
+      } else {
+         cs->current = agx_cdm_barrier(cs->current, dev->dev.chip);
+      }
+      /* Record the trailing flush so a back-to-back barrier request at a
+       * declared dependency can reuse it (G15+ already did this). */
+      cs->strong_flush_end = cs->current;
       break;
 
    case AGX_CS_GENERATION_G15:
@@ -701,10 +720,28 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
 
    hk_ensure_cs_has_space(cs->cmd, cs, 0x2000 /* TODO */);
    cs->stats.cmds++;
+
+   if (HK_PERF(dev, ALWAYSCDMBARRIER)) {
+      cs->current =
+         agx_cdm_launch(cs->current, dev->dev.chip, grid, wg, launch, usc);
+      hk_cdm_cache_flush(dev, cs);
+      return;
+   }
+
+   /* Dependency-tracked CDM barrier: this launch's writes stay cached, and
+    * cdm_dirty remembers them. The flush lands where Vulkan makes them
+    * visible: the next vkCmdPipelineBarrier2 in this command buffer, the
+    * end of the stream's batch, or hk_EndCommandBuffer (queue submission
+    * order orders the next submission after this one). Launches the app
+    * left unordered inside one command buffer keep skipping the drain
+    * entirely. Driver-internal ordering that does not ride on
+    * vkCmdPipelineBarrier (query availability writes) calls
+    * hk_cdm_cache_flush explicitly and is unaffected.
+    */
+   cs->cmd->state.cs.cdm_dirty = true;
+
    cs->current =
       agx_cdm_launch(cs->current, dev->dev.chip, grid, wg, launch, usc);
-
-   hk_cdm_cache_flush(dev, cs);
 }
 
 void

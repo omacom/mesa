@@ -957,6 +957,7 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    perf_debug(cmd, "End command buffer");
    hk_flush_deferred_clears(cmd);
    hk_sync_flush_pending_timestamp(cmd);
+
    hk_cmd_buffer_end_compute(cmd);
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
    hk_resolve_deferred_oq_available(cmd);
@@ -1058,6 +1059,45 @@ hk_classify_pass_barrier(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info
    return hk_barrier_classify(info, &state);
 }
 
+/* xfer/compute→* barriers need a CDM visibility record in the stream that
+ * holds the source. The G14 dependency-tracked fast path used to skip this
+ * and only flush through cdm_dirty. */
+static void
+hk_cdm_xfer_visibility_at_barrier(struct hk_cmd_buffer *cmd,
+                                  const VkDependencyInfo *dep)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   uint8_t src_kinds, dst_kinds;
+
+   hk_sync_dependency_kinds(dep, hk_sync_image_class(cmd), &src_kinds,
+                          &dst_kinds);
+   if (!(src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER)) || !dst_kinds)
+      return;
+
+   const bool alias_scope = hk_cdm_alias_scope(dev);
+   struct hk_cs *list[16];
+   unsigned n = 0;
+
+   if (cmd->current_cs.cs && n < ARRAY_SIZE(list))
+      list[n++] = cmd->current_cs.cs;
+   list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
+      if (cs == cmd->current_cs.cs || n >= ARRAY_SIZE(list))
+         continue;
+      list[n++] = cs;
+   }
+
+   for (unsigned i = 0; i < n; i++) {
+      struct hk_cs *cs = list[i];
+
+      if (cs->type != HK_CS_CDM ||
+          !hk_cdm_visibility_flush_needed(dev, cs, alias_scope))
+         continue;
+
+      hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
+      hk_cdm_visibility_flush(dev, cs, alias_scope);
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
                        const VkDependencyInfo *pDependencyInfo)
@@ -1098,6 +1138,35 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    /* M5 records its barriers with the native dependency tracker. */
    if (!agx_native_graphics(&dev->dev) && !agx_chip_g17_m5(dev->dev.chip)) {
+      if (!HK_PERF(dev, ALWAYSCDMBARRIER)) {
+         /* Outside a render pass only a CDM control stream can be open; the
+          * batches must end when a graphics batch is open: the dependency
+          * then spans batch types and the kernel orders the resulting
+          * commands (agx_cmd_header barriers). */
+         if (!cmd->current_cs.gfx && !cmd->current_cs.pre_gfx &&
+             !cmd->current_cs.post_gfx) {
+            /* The app declared a memory dependency: flush unflushed CDM work
+             * here, at the visibility point, in the stream that holds it.
+             * Deferring the record to the next CDM launch loses it when the
+             * consumer is graphics or was recorded in another command
+             * buffer (ExecuteSecondaryCommandBuffer); dEQP
+             * memory.pipeline_barrier.transfer_* fails that way. The batch
+             * stays open: merge_control_streams stitches it back together
+             * at hk_EndCommandBuffer, without a stream link per barrier.
+             */
+            hk_cdm_flush_all_dirty(cmd);
+            hk_cdm_xfer_visibility_at_barrier(cmd, pDependencyInfo);
+
+            /* Preserve the same conservative ordering in the shared submit
+             * graph, including kernels that advertise exact prior barriers
+             * on AGX2. */
+            hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_ALL);
+            return;
+         }
+      }
+
+      hk_cdm_flush_all_dirty(cmd);
+      hk_cdm_xfer_visibility_at_barrier(cmd, pDependencyInfo);
       hk_cmd_buffer_end_compute(cmd);
       hk_cmd_buffer_end_graphics(cmd);
       /* Preserve the same conservative ordering in the shared submit graph,

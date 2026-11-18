@@ -1000,6 +1000,16 @@ hk_m5_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
 struct hk_compute_state {
    struct hk_descriptor_state descriptors;
    struct hk_api_shader *shader;
+
+   /* True while this command buffer holds CDM launches whose writes are
+    * still cached: the dependency-tracked barrier flushed neither at a
+    * vkCmdPipelineBarrier2 nor at a batch boundary. Set by each tracked
+    * launch, cleared wherever a CDM cache flush is emitted for the stream
+    * holding those launches (hk_cdm_flush_dirty). Lives on the command
+    * buffer, not the hk_cs, so it survives CS splits and
+    * merge_control_streams.
+    */
+   bool cdm_dirty;
 };
 
 /*
@@ -2283,12 +2293,15 @@ bool hk_g17p_smooth_varyings_supported(
 void *hk_cmd_buffer_emit_vdm_terminate(struct hk_cmd_buffer *cmd,
                                        void *current);
 
+void hk_cdm_flush_all_dirty(struct hk_cmd_buffer *cmd);
+
 static void
 hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
                                    struct hk_cs **ptr)
 {
    if (*ptr) {
       struct hk_cs *cs = *ptr;
+      hk_cdm_flush_all_dirty(cmd);
       if (unlikely(cs->query_reset_pending))
          hk_flush_query_resets(cmd, cs);
 
@@ -2548,6 +2561,9 @@ void hk_usc_upload_spilled_rt_descs(struct agx_usc_builder *b,
                                     struct hk_cmd_buffer *cmd);
 
 void hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs);
+
+void hk_cdm_flush_dirty(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+void hk_cdm_flush_all_dirty(struct hk_cmd_buffer *cmd);
 
 /* As hk_cdm_cache_flush(), for a flush an application dependency asks for.
  * With `memory`, the flush also has memory scope on G17P (M5 flushes always
