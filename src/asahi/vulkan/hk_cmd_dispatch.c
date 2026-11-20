@@ -48,11 +48,26 @@
 /* The G18G image-write state record (AGX_G18G_WRITE_STATE1_INIT). */
 static const uint8_t hk_g18g_write_state1[32] = AGX_G18G_WRITE_STATE1_INIT;
 
-/* Diagnostic controls, read once: these are consulted per dispatch, and an
- * uncached getenv() scans the whole environment. */
-DEBUG_GET_ONCE_BOOL_OPTION(m5_launch_debug, "ASAHI_M5_LAUNCH_DEBUG", false)
-DEBUG_GET_ONCE_BOOL_OPTION(m5_verify_compute_loader,
-                           "AGX_M5_VERIFY_COMPUTE_LOADER", false)
+/* G18G: most dependent compute launches that share one CDM stream (one
+ * submit, one fence; hk_dispatch_g17g_native).
+ *
+ * 64 is where decode throughput stops rising, measured on one G18G with
+ * llama-bench (7B Q4_0, -fa off -p 0 -n 32 -r 3) in 07a390b08a9: 1.83
+ * (batch 8), 2.76 (16), 3.14 (32), 3.44 (64), 3.43 (128) and 3.40 (256)
+ * tokens per second, with identical generated text and no G18 failure
+ * lines. Prefill (pp512, pp2048 at -ub 512 and 2048) does not regress at
+ * 64. The earlier ceiling of 8 (ba6b26abb75) came from a firmware stall
+ * above 9 launches per stream on large flat grids (G18_RECOVERY_PB
+ * restart loop -> G18_APP_JOB_FAILED EIO); it did not reproduce at batch
+ * 10 to 256 on decode or at 64 on prefill, but its cause is not known.
+ */
+#define HK_G18_BATCH_LAUNCHES 64
+
+/* The stream must stay under the kernel's g18_compute_stream_max (64 KiB
+ * with the G18 admission patch), which ba6b26abb75 put at 1400 launches. */
+static_assert(HK_G18_BATCH_LAUNCHES <= 1400,
+              "G18G CDM stream exceeds the kernel's stream size limit");
+
 /* EXP-G1b's native access::write argument is a PBE pointer followed by a
  * pointer to this control descriptor, including when it follows a sampled
  * texture in the argument table. It is not the read_write clamp scalar. */
@@ -538,12 +553,11 @@ hk_cmd_resolve_compute_border(struct hk_cmd_buffer *cmd)
 }
 
 /* Whether a strong flush recorded for `dev` with this request has memory
- * scope: on request on G17P and M5. */
+ * scope: on request where the form exists (G17P and M5). */
 static bool
 hk_cdm_flush_has_memory_scope(const struct hk_device *dev, bool memory)
 {
-   return memory && (dev->dev.chip == AGX_CHIP_G17P ||
-                     agx_chip_g17_m5(dev->dev.chip));
+   return memory && hk_cdm_memory_scope_form(dev);
 }
 
 bool
@@ -1541,6 +1555,7 @@ hk_dispatch_precomp_g17p(struct hk_cmd_buffer *cmd, struct agx_grid grid,
        * launch between them is a shape Apple's CDM emitter never produces and
        * the G17P stream oracle rejects. */
       cs->weak_barrier_end = cs->current;
+      cs->app_dispatch_end = NULL;
       if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy))
          hk_frame_anatomy_note_precomp(cs, idx, grid);
       cs->stats.cmds++;
@@ -1768,7 +1783,6 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                       struct hk_shader *s, struct agx_grid grid,
                       struct agx_workgroup local_size)
 {
-   const char *reason = "shader profile";
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_linked_shader *linked = s ? s->only_linked : NULL;
    if (s && !linked && s->info.stage == MESA_SHADER_VERTEX)
@@ -1790,7 +1804,6 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       return;
 
    if (s->b.info.uses_matrix16) {
-      reason = "matrix kernel feature";
       if (!(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_MATRIX))
          goto refused;
       cs->m5_matrix_ops = true;
@@ -1817,14 +1830,12 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    const bool collected = internal
       ? hk_g17p_internal_graphics_uniform_ranges(cmd, s, linked, root, texture_pointers, ranges, &count)
       : hk_g17p_compute_uniform_ranges(dev->dev.chip, cmd, s, root, texture_pointers, ranges, &count);
-   reason = "uniform ranges";
    if (!collected)
       goto refused;
    if (!internal && s->b.info.agx3_uniform_dma_count &&
        !hk_m5_compute_uniform_dma_ranges(cmd, s, root, ranges,
                                          ARRAY_SIZE(ranges), &count))
       goto refused;
-   reason = "program bound";
    size_t capacity;
    if (!agx3_g17g_graphics_program_bound(dev->dev.chip, ranges, count, &capacity))
       goto refused;
@@ -1850,7 +1861,6 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          ? MAX2(256u, ALIGN_POT(s->b.info.local_size, 64u)) : 0,
    };
    if (s->b.info.has_preamble) {
-      reason = "native constant-program extent";
       if (internal || !s->bo || !s->bo->va ||
           !hk_agx3_g17p_constant_program_from_binary(
              s->code_ptr, s->code_size, s->b.info.preamble_offset,
@@ -1870,17 +1880,16 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       .program_va = reservation.va, .shader_va = shader_va,
    };
    struct agx3_compute_program launch;
-   reason = "program generation";
    if (loader) {
       program.length = loader->length;
       memcpy(program.bytes, loader->bytes, loader->length);
       hk_g17p_patch_plan_apply(&loader->plan, ranges, program.bytes);
-      if (debug_get_option_m5_verify_compute_loader()) {
+      if (dev->dev.debug & AGX_DBG_VERIFY) {
          struct agx3_g17p_graphics_program fresh;
          if (!agx3_g17g_compute_program_generate(dev->dev.chip, &desc, &fresh) ||
              fresh.length != program.length ||
              memcmp(fresh.bytes, program.bytes, program.length)) {
-            reason = "cached program byte mismatch";
+            mesa_loge("M5 cached compute launch differs from fresh composition");
             goto refused;
          }
       }
@@ -1926,7 +1935,6 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       .dimensions = grid.count[2] != 1 || local_size.z != 1 ? 3
                   : grid.count[1] != 1 || local_size.y != 1 ? 2 : 1,
    };
-   reason = "dispatch record";
    const uint32_t local[3] = {local_size.x, local_size.y, local_size.z};
    if (cmd->m5_rt_capture) {
       /* Single-kick vkCmdTraceRays* (hk_cmd_trace_rays.c): produce this
@@ -1991,27 +1999,6 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    cs->stats.cmds++;
    return;
 refused:
-   if (debug_get_option_m5_launch_debug()) {
-      fprintf(stderr, "M5 compute refused: %s stage=%u scratch=%u/%u "
-              "gprs=%u staging=%u:%u local=%u preamble=%u "
-              "textures=%u samplers=%u heap=%u txf=%u sets=%u "
-              "resource_flags=%u%u%u%u%u indirect=%u\n",
-              reason, s ? s->info.stage : 0,
-              s ? s->b.info.scratch_size : 0, linked ? linked->b.scratch_size : 0,
-              linked ? linked->b.nr_gprs : 0,
-              s ? s->b.info.agx3_staging_known : 0,
-              s ? s->b.info.agx3_staging_halfs : 0,
-              s ? s->b.info.local_size : 0, s ? s->b.info.has_preamble : 0,
-              s ? s->b.info.texture_state_count : 0,
-              s ? s->b.info.sampler_state_count : 0,
-              s ? s->b.info.uses_sampler_heap : 0,
-              linked ? linked->b.uses_txf : 0, s ? s->info.set_count : 0,
-              s ? s->info.agx3_txf_texture_valid : 0,
-              s ? s->info.agx3_storage_image_valid : 0,
-              s ? s->info.agx3_sampled_storage_valid : 0,
-              s ? s->info.agx3_indexed_storage_valid : 0,
-              s ? s->info.agx3_indexed_sampler_valid : 0, agx_is_indirect(grid));
-   }
    mesa_loge_once("M5 compute launch exceeds the current resource profile");
    vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
 }
@@ -2469,6 +2456,7 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        * launch between them is a shape Apple's CDM emitter never produces and
        * the G17P stream oracle rejects. */
       cs->weak_barrier_end = cs->current;
+      cs->app_dispatch_end = NULL;
       cs->stats.cmds++;
       return;
    }
@@ -2509,21 +2497,22 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    /* Two application dispatches in a row need no barrier between them: drop
     * the previous one's weak tail, which nothing else has followed or
     * strengthened, and let this launch's own tail end the stream instead.
-    * As on M5, a kernel with a large per-thread scratch frame keeps its
-    * barrier. */
+    * Indirect launches, ray-tracing kernels, and kernels with a large
+    * per-thread scratch frame keep their barrier. */
    const bool app_dispatch =
-      (!cmd->in_meta && s && s->info.stage == MESA_SHADER_COMPUTE &&
-       linked &&
-       MAX3(s->b.info.scratch_size, linked->b.scratch_size,
-            linked->b.agx3_spectpr_scratch_size) <=
-          HK_M5_OVERLAP_MAX_SCRATCH_B &&
-       agx_chip_elide_app_dispatch_barrier(dev->dev.chip)) ||
-      /* An acceleration-structure build orders every launch that depends on
-       * another with a pipeline barrier, which strengthens the earlier
-       * launch's tail; launches with none between them (one step of several
-       * builds, the fills after the leaves) run side by side. */
-      (cmd->state.as_build_recording && s && s->info.stage == MESA_SHADER_COMPUTE &&
-       !s->b.info.uses_ray_traversal);
+      s && s->info.stage == MESA_SHADER_COMPUTE &&
+      !s->b.info.uses_ray_traversal &&
+      !cmd->state.cs.descriptors.root.cs.trace_rays_addr &&
+      ((!cmd->in_meta && linked &&
+        MAX3(s->b.info.scratch_size, linked->b.scratch_size,
+             linked->b.agx3_spectpr_scratch_size) <=
+           HK_M5_OVERLAP_MAX_SCRATCH_B &&
+        agx_chip_elide_app_dispatch_barrier(dev->dev.chip)) ||
+       /* An acceleration-structure build orders every launch that depends on
+        * another with a pipeline barrier, which strengthens the earlier
+        * launch's tail; launches with none between them (one step of several
+        * builds, the fills after the leaves) run side by side. */
+       cmd->state.as_build_recording);
    if (app_dispatch && cs->app_dispatch_end &&
        cs->current == cs->app_dispatch_end &&
        cs->current == cs->weak_barrier_end) {
@@ -2742,13 +2731,6 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   if (hk_g17p_launch_trace_enabled()) {
-      for (size_t i = 0; i < range_count; ++i)
-         fprintf(stderr, "M5_COMPUTE_UNIFORMS program=%" PRIx64
-                 " start=%u count=%u address=%" PRIx64 "\n",
-                program_t.gpu, ranges[i].start_halfs,
-                 ranges[i].size_halfs, ranges[i].address);
-   }
 
    const uint32_t threadgroup_bytes =
       s->b.info.local_size
@@ -2839,23 +2821,11 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       /* Dependent dispatches share one stream (the strong barrier between
        * launches orders them) and hk_EndCommandBuffer appends the final
        * terminate: N dispatches become 1 submit + 1 fence. The stream is
-       * capped at HK_G18_BATCH launches so it stays under the kernel's
-       * g18_compute_stream_max (64 KiB with the G18 admission patch); at
+       * capped at HK_G18_BATCH_LAUNCHES launches (see its definition); at
        * the cap the stream terminates and seals, and the next dispatch
        * rotates to a fresh stream (dispatch_grid's g18_dispatch_sealed
-       * check). The default 64 is where decode throughput stops rising:
-       * 7B Q4_0 on a G18G measured 1.83 (batch 8), 3.14 (32), 3.44 (64),
-       * 3.43 (128) and 3.40 (256) tokens per second, with identical output
-       * and no G18 failure lines. The older ceiling of 8 came from a
-       * firmware stall above 9 launches per stream on large flat grids
-       * (G18_RECOVERY_PB restart loop -> G18_APP_JOB_FAILED EIO); it did
-       * not reproduce at batch 10 to 256 (decode) or at batch 64 on 512-
-       * and 2048-token prefill with -ub 512 and -ub 2048. */
-      /* Clamped to 1400 so the stream stays under the kernel's 64 KiB
-       * g18_compute_stream_max even with an oversized user value
-       * (w7Q PR-10 smaller finding). */
-      const uint32_t batch_limit =
-         MIN2(debug_get_num_option("HK_G18_BATCH", 64), 1400);
+       * check). */
+      const uint32_t batch_limit = HK_G18_BATCH_LAUNCHES;
       /* rel31 (w7C's plan rule + w7P's validator semantics): the kernel
        * sizes the stream's compute plan (pool/SMA/counters) from these
        * resource words alone, and last-wins under-sizes a stream whose
@@ -2905,17 +2875,6 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          sink.length += sizeof(terminate);
          cs->g18_dispatch_sealed = true;
       }
-   }
-   if (hk_g17p_launch_trace_enabled()) {
-      fprintf(stderr, "%s native compute recorded: program=%" PRIx64
-              " bytes=%u shader=%" PRIx64 " size=%u ranges=%zu grid=%ux%ux%u local=%ux%ux%u\n",
-              agx_chip_name(dev->dev.chip), program_t.gpu,
-              program.length, shader_va, (unsigned)linked->b.size,
-              range_count, grid.count[0], grid.count[1], grid.count[2],
-              local_size.x, local_size.y, local_size.z);
-      hk_g17p_trace_hexdump("AGX3-compute-ioto", program_t.gpu,
-                            program.bytes, program.length);
-      hk_g17p_trace_hexdump("AGX3-compute-stream", cs->addr, sink.data, sink.length);
    }
    cs->current = (uint32_t *)((uint8_t *)cs->current + sink.length);
    cs->stats.cmds++;
@@ -2992,6 +2951,8 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
          return;
    }
    hk_dispatch_with_local_size(cmd, cs, s, grid, local_size);
+   cs->uses_global_atomics |= s->b.info.uses_global_atomics;
+   cs->pack_loops |= s->b.info.has_loops;
    if (agx_is_indirect(grid)) {
       cs->sib_indirect = true;
    } else {
@@ -2999,6 +2960,19 @@ dispatch_grid(struct hk_cmd_buffer *cmd, struct agx_grid grid, bool in_threads)
          (uint64_t)grid.count[0] * grid.count[1] * grid.count[2];
       cs->sib_threads = threads > UINT64_MAX - cs->sib_threads
                            ? UINT64_MAX : cs->sib_threads + threads;
+
+      /* What submit packing bounds a packet with (hk_pack_plan()). Static
+       * instruction counts bound a program without loops; pack_loops marks
+       * the others, at most one of which a packet holds. */
+      uint64_t work;
+      if (__builtin_mul_overflow(threads, (uint64_t)s->b.info.stats.instrs,
+                                 &work))
+         work = UINT64_MAX;
+      cs->pack_threads = threads > UINT64_MAX - cs->pack_threads
+                            ? UINT64_MAX : cs->pack_threads + threads;
+      cs->pack_static_work = work > UINT64_MAX - cs->pack_static_work
+                                ? UINT64_MAX : cs->pack_static_work + work;
+      cs->pack_dispatches++;
    }
    if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy)) {
       hk_frame_anatomy_note_fs(cs, s);
@@ -3206,9 +3180,10 @@ hk_CmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer _buffer,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
    /* A residency bitmap is only useful with the helper that reads it. That
-    * helper is built for devices that enabled sparseResidencyBuffer, which is
-    * the only way to create a buffer carrying a bitmap; if it is somehow
-    * absent, keep the old behaviour rather than refusing the dispatch. */
+    * helper is built, on chips with native indirect compute, for devices that
+    * enabled sparseResidencyBuffer, which is the only way to create a buffer
+    * carrying a bitmap. Other chips have no helper: keep reading the
+    * arguments through the shadow there. */
    const bool have_sparse_helper = dev->g17p_grid_helper_sparse != NULL;
    const bool use_primary =
       agx_native_graphics(&dev->dev) && buffer->va &&

@@ -103,6 +103,8 @@ hk_files = files(
   'hk_drm_render_core.c',
   'hk_drm_render_core.h',
   'hk_execution_allowance.h',
+  'hk_pack.c',
+  'hk_pack.h',
   'hk_queue.c',
   'hk_queue.h',
   'hk_frame_anatomy.c',
@@ -268,6 +270,29 @@ if with_tests
       suite : ['asahi'],
     )
 
+    # Submit packing: the member check, the planner and the dependency fold,
+    # resolved through the real hk_sync resolver; no device or GPU.
+    test(
+      'hk_pack',
+      executable(
+        'hk_pack_test',
+        files('tests/test-hk-pack.c', 'hk_pack.c', 'hk_sync.c'),
+        include_directories : [
+          include_directories('.'),
+          inc_gallium, inc_gallium_aux, inc_include, inc_src, inc_asahi,
+          inc_virtio_gpu, inc_virtio_vdrm,
+        ],
+        dependencies : [
+          idep_nir_headers, idep_mesautil, idep_libagx,
+          idep_libagx_shaders_h, idep_agx_pack,
+          idep_vulkan_runtime_headers, idep_vulkan_util_headers,
+        ],
+        link_args : [ld_args_gc_sections],
+        gnu_symbol_visibility : 'hidden',
+      ),
+      suite : ['asahi'],
+    )
+
     # The deferred occlusion-availability resolver against mock control
     # streams, with the real hk_sync stream bookkeeping it drops streams from.
     test(
@@ -367,7 +392,6 @@ if with_tests
       'hk_agx3_ioto_program_core_test',
       files('tests/test-hk-agx3-ioto-program-core.c',
             'hk_agx3_ioto_program_core.c',
-            '../compiler/agx_g18_gates.c',
             '../compiler/agx3_compute_program.c',
             '../compiler/agx3_graphics_program.c',
             '../compiler/agx3_m5_graphics_program.c',
@@ -1001,12 +1025,67 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  # Submit packing on hardware: run with HK_PACK_CDM_SUBMIT=0 and =1.
+  executable(
+    'aurora-packtest',
+    files('tests/aurora_packtest.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan'), dep_thread],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   # Also no-op shim tests, registered with the shim in ../meson.build.
   g17p_vulkan_compressed_mip_blit = executable(
     'g17p-vulkan-compressed-mip-blit',
     files('tests/g17p_vulkan_compressed_mip_blit.c'),
     include_directories : [inc_include],
     dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  hk_vulkan_global_priority = executable(
+    'hk-vulkan-global-priority',
+    files('tests/hk_vulkan_global_priority.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  hk_vulkan_sparse_bind_first_submit = executable(
+    'hk-vulkan-sparse-bind-first-submit',
+    files('tests/hk_vulkan_sparse_bind_first_submit.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  hk_vulkan_descriptor_buffer_sizes = executable(
+    'hk-vulkan-descriptor-buffer-sizes',
+    files('tests/hk_vulkan_descriptor_buffer_sizes.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  hk_vulkan_descriptor_buffer_texel = executable(
+    'hk-vulkan-descriptor-buffer-texel',
+    files('tests/hk_vulkan_descriptor_buffer_texel.c'),
+    include_directories : [inc_include, inc_src],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  hk_vulkan_bg_eot_threads = executable(
+    'hk-vulkan-bg-eot-threads',
+    files('tests/hk_vulkan_bg_eot_threads.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan'), dep_thread],
     c_args : [c_msvc_compat_args],
     gnu_symbol_visibility : 'hidden',
   )
@@ -1096,7 +1175,9 @@ if with_tests
     files('tests/test-hk-lost-object-submit.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
       inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
-    dependencies : [hk_deps], link_with : [libhk]),
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [hk_wrap_test_link_args,
+      '-Wl,--wrap=vk_queue_wait_lost_submissions']),
     timeout : 30, suite : ['asahi'])
 endif
 

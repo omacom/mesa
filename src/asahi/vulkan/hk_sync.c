@@ -32,14 +32,10 @@ dep_max(struct hk_sync_dep *a, const struct hk_sync_dep *b)
    a->prior |= b->prior;
 }
 
-/* The destination classes a stream of the given kinds belongs to: graphics
- * work is in every graphics class (HK_SYNC_GFX_FRAG, HK_SYNC_GFX_IMG). */
 static inline uint8_t
 full_kinds(uint8_t kinds)
 {
-   return kinds & HK_SYNC_GFX
-             ? kinds | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG
-             : kinds;
+   return hk_sync_full_kinds(kinds);
 }
 
 /* The requirement on the next stream of the given kinds: the union over the
@@ -97,8 +93,6 @@ hk_sync_reset(struct hk_cmd_buffer *cmd)
    memset(&cmd->sync, 0, sizeof(cmd->sync));
    util_dynarray_clear(&cmd->sync_pass_records);
 }
-
-DEBUG_GET_ONCE_BOOL_OPTION(sync_tile_index, "ASAHI_SYNC_TILE_INDEX", true)
 
 #define TILE_BUCKETS 256
 #define TILE_INDEX_NONE UINT32_MAX
@@ -1626,6 +1620,36 @@ resolve_absolute(const struct submit_state *ss, const struct hk_sync_dep *dep,
    return value;
 }
 
+/* What resolve_prior() and resolve_absolute() wait for, as kinds: a kind
+ * with a latest stream in an earlier command buffer of the submission
+ * (ss->last, from cmd->sync.last), else one the queue ran before (legacy:
+ * hk_sync_queue::ever) or holds a latest position of (exact:
+ * last_absolute). */
+uint8_t
+hk_sync_queue_kinds(const struct hk_sync_queue *q, unsigned sq)
+{
+   if (!q->exact_prior)
+      return q->ever[sq];
+
+   uint8_t kinds = 0;
+   for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+      if (q->last_absolute[k][sq])
+         kinds |= BITFIELD_BIT(k);
+   }
+   return kinds;
+}
+
+uint8_t
+hk_sync_cmd_kinds(const struct hk_cmd_buffer *cmd, unsigned sq)
+{
+   uint8_t kinds = 0;
+   for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+      if (cmd->sync.last[k][sq])
+         kinds |= BITFIELD_BIT(k);
+   }
+   return kinds;
+}
+
 /* Tile hazards across submissions (hk_sync.h). */
 static bool
 recent_may_run(const struct hk_sync_queue *q, uint64_t completed)
@@ -1779,11 +1803,21 @@ resolve_one(const struct submit_state *ss, unsigned sq,
    }
 }
 
+void
+hk_sync_load_resolved(struct hk_cs *cs, const struct hk_sync_resolved *r)
+{
+   memcpy(cs->sync.barrier, r->barrier, sizeof(r->barrier));
+   memcpy(cs->sync.barrier_ta, r->barrier_ta, sizeof(r->barrier_ta));
+   memcpy(cs->sync.prior, r->prior, sizeof(r->prior));
+   memcpy(cs->sync.prior_ta, r->prior_ta, sizeof(r->prior_ta));
+   cs->sync.ta_split = r->ta_split;
+}
+
 bool
 hk_sync_resolve_submit(struct hk_queue *queue,
                        struct hk_cmd_buffer *const *cmdbufs, unsigned count,
                        bool first_cdm_is_flush, bool chain_first,
-                       uint64_t completed)
+                       uint64_t completed, struct hk_sync_resolved *out)
 {
    /* Validate all ordinal arithmetic before mutating command or queue state.
     * Historical ordinals use zero for absence, so wrapping them is invalid.
@@ -1801,9 +1835,9 @@ hk_sync_resolve_submit(struct hk_queue *queue,
       }
    }
 
-   bool indexed = debug_get_option_sync_tile_index() &&
-      (!queue->sync.precise_tile_evictions || queue->sync.last_preserve ||
-       submit_preserves_tiles(cmdbufs, count));
+   bool indexed = !queue->sync.precise_tile_evictions ||
+                  queue->sync.last_preserve ||
+                  submit_preserves_tiles(cmdbufs, count);
    if (indexed) {
       indexed = false;
       for (unsigned i = 0; i < count && !indexed; ++i) {
@@ -1834,7 +1868,7 @@ hk_sync_resolve_submit(struct hk_queue *queue,
     * With only one, recorded dependencies already order all its passes.
     * Publish its original records to queue history after resolving hazards,
     * avoiding an allocation and a second copy without exposing this submit
-    * as earlier history to itself. Keep other devices on their existing path.
+    * as earlier history to itself.
     */
    const bool direct_footprints =
       queue->sync.direct_single_footprints && count == 1;
@@ -1857,6 +1891,32 @@ hk_sync_resolve_submit(struct hk_queue *queue,
       }
    }
 
+   /* Legacy kernels attach input syncs to the first hardware command only;
+    * the caller requests that chain when needed. A sparse flush must still
+    * precede everything. Every
+    * command that does not already follow the first one transitively gets
+    * an explicit wait on it. Waits are prefixes, so following any command
+    * that follows the first is enough. */
+   /* The first command is the first stream of the first command buffer that
+    * emits any: command buffers without streams (barrier-only or empty) send
+    * nothing to the kernel. Without any command there is nothing to chain. */
+   int first_sq = first_cdm_is_flush ? HK_SYNC_CDM : -1;
+   for (unsigned i = 0; first_sq < 0 && i < count; ++i) {
+      if (!list_is_empty(&cmdbufs[i]->control_streams))
+         first_sq = hk_sync_sq(list_first_entry(&cmdbufs[i]->control_streams,
+                                                struct hk_cs, node));
+   }
+   const bool chain = (chain_first || first_cdm_is_flush) && first_sq >= 0;
+
+   /* covered[sq]: the lowest index on sq of a command that follows the
+    * first command, 0 if none yet. A wait on prefix b of subqueue d
+    * follows the first command when covered[d] is within that prefix. */
+   uint32_t covered[HK_SYNC_NUM_SQ] = {0, first_cdm_is_flush ? 1 : 0};
+   bool seen_first = first_cdm_is_flush;
+
+   /* A command buffer may occur more than once: everything below that reads
+    * or writes a stream's index and resolved fields finishes with one
+    * occurrence, and saves it to out, before the next one starts. */
    for (unsigned i = 0; i < count; ++i) {
       struct hk_cmd_buffer *cmd = cmdbufs[i];
 
@@ -1969,36 +2029,9 @@ hk_sync_resolve_submit(struct hk_queue *queue,
                ss.last[k][sq] = value_max(ss.last[k][sq], last->sync.index);
          }
       }
-   }
 
-   /* Legacy kernels attach input syncs to the first hardware command only;
-    * the caller requests that chain when needed. A sparse flush must still
-    * precede everything. Every
-    * command that does not already follow the first one transitively gets
-    * an explicit wait on it. Waits are prefixes, so following any command
-    * that follows the first is enough. */
-   /* The first command is the first stream of the first command buffer that
-    * emits any: command buffers without streams (barrier-only or empty) send
-    * nothing to the kernel. Without any command there is nothing to chain. */
-   int first_sq = first_cdm_is_flush ? HK_SYNC_CDM : -1;
-   for (unsigned i = 0; first_sq < 0 && i < count; ++i) {
-      if (!list_is_empty(&cmdbufs[i]->control_streams))
-         first_sq = hk_sync_sq(list_first_entry(&cmdbufs[i]->control_streams,
-                                                struct hk_cs, node));
-   }
-
-   if ((chain_first || first_cdm_is_flush) && first_sq >= 0) {
-      /* covered[sq]: the lowest index on sq of a command that follows the
-       * first command, 0 if none yet. A wait on prefix b of subqueue d
-       * follows the first command when covered[d] is within that prefix. */
-      uint32_t covered[HK_SYNC_NUM_SQ] = {0, 0};
-      if (first_cdm_is_flush)
-         covered[HK_SYNC_CDM] = 1;
-
-      bool seen_first = first_cdm_is_flush;
-      for (unsigned i = 0; i < count; ++i) {
-         list_for_each_entry(struct hk_cs, cs, &cmdbufs[i]->control_streams,
-                             node) {
+      list_for_each_entry(struct hk_cs, cs, &cmd->control_streams, node) {
+         if (chain) {
             const unsigned sq = hk_sync_sq(cs);
             bool covers = false;
 
@@ -2023,41 +2056,44 @@ hk_sync_resolve_submit(struct hk_queue *queue,
             if (covers && covered[sq] == 0)
                covered[sq] = cs->sync.index;
          }
-      }
-   }
 
-   /* A render's vertex half may wait for less than its fragment half only
-    * when the kernel orders the halves separately and nothing above raised
-    * the whole render's fields afterwards (cross-command-buffer tile hazards
-    * and the first-command chain only touch barrier[]): recompute, and keep
-    * the vertex half at least as strict as before. */
-   for (unsigned i = 0; i < count; ++i) {
-      list_for_each_entry(struct hk_cs, cs, &cmdbufs[i]->control_streams,
-                          node) {
+         /* A render's vertex half may wait for less than its fragment half
+          * only when the kernel orders the halves separately and nothing
+          * above raised the whole render's fields afterwards
+          * (cross-command-buffer tile hazards and the first-command chain
+          * only touch barrier[]): recompute, and keep the vertex half at
+          * least as strict as before. */
          cs->sync.ta_split = false;
-         if (cs->type == HK_CS_CDM)
-            continue;
-         if (chain_first || first_cdm_is_flush) {
+         if (cs->type != HK_CS_CDM && (chain_first || first_cdm_is_flush)) {
             memcpy(cs->sync.barrier_ta, cs->sync.barrier,
                    sizeof(cs->sync.barrier_ta));
             memcpy(cs->sync.prior_ta, cs->sync.prior,
                    sizeof(cs->sync.prior_ta));
-            continue;
+         } else if (cs->type != HK_CS_CDM) {
+            /* M5: tiling whose pre-rasterization programs keep state in
+             * thread-private storage corrupts that state when it overlaps an
+             * earlier render's fragment work (Counter-Strike 2: one-frame
+             * garbage geometry and blocks, only for such renders). Such a
+             * render's vertex half keeps the whole render-subqueue prefix;
+             * its compute prefix may still be narrower. */
+            if (cs->m5_vertex_tps) {
+               cs->sync.barrier_ta[HK_SYNC_VDM] = cs->sync.barrier[HK_SYNC_VDM];
+               cs->sync.prior_ta[HK_SYNC_VDM] = cs->sync.prior[HK_SYNC_VDM];
+            }
+            for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+               cs->sync.ta_split |=
+                  cs->sync.barrier_ta[sq] != cs->sync.barrier[sq] ||
+                  cs->sync.prior_ta[sq] != cs->sync.prior[sq];
+            }
          }
-         /* M5: tiling whose pre-rasterization programs keep state in
-          * thread-private storage corrupts that state when it overlaps an
-          * earlier render's fragment work (Counter-Strike 2: one-frame
-          * garbage geometry and blocks, only for such renders). Such a
-          * render's vertex half keeps the whole render-subqueue prefix;
-          * its compute prefix may still be narrower. */
-         if (cs->m5_vertex_tps) {
-            cs->sync.barrier_ta[HK_SYNC_VDM] = cs->sync.barrier[HK_SYNC_VDM];
-            cs->sync.prior_ta[HK_SYNC_VDM] = cs->sync.prior[HK_SYNC_VDM];
-         }
-         for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
-            cs->sync.ta_split |=
-               cs->sync.barrier_ta[sq] != cs->sync.barrier[sq] ||
-               cs->sync.prior_ta[sq] != cs->sync.prior[sq];
+
+         if (out) {
+            struct hk_sync_resolved *r = out++;
+            memcpy(r->barrier, cs->sync.barrier, sizeof(r->barrier));
+            memcpy(r->barrier_ta, cs->sync.barrier_ta, sizeof(r->barrier_ta));
+            memcpy(r->prior, cs->sync.prior, sizeof(r->prior));
+            memcpy(r->prior_ta, cs->sync.prior_ta, sizeof(r->prior_ta));
+            r->ta_split = cs->sync.ta_split;
          }
       }
    }

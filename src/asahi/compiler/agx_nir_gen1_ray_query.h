@@ -11,7 +11,6 @@ struct agx_gen1_ray_query_layout {
    bool graphics_stage;
    bool compute_kernel;
    bool position_fetch;
-   bool diagnostic_features;
 };
 #define AGX_GEN1_VERTEX_DIRECTORY_VA UINT64_C(0x10040000000)
 #define AGX_GEN1_VERTEX_DIRECTORY_BYTES 0x8000u
@@ -27,8 +26,6 @@ struct agx_gen1_ray_candidate {
    nir_def *compressed_address, *flags, *barycentrics, *distance;
 };
 struct nir_builder;
-nir_def *agx_nir_gen1_candidate_count(struct nir_builder *b,
-                                     nir_def *query, nir_def *lane);
 struct agx_gen1_ray_candidate
 agx_nir_gen1_load_candidate(struct nir_builder *b, nir_def *query,
                             nir_def *lane, nir_def *index);

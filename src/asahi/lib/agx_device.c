@@ -115,6 +115,7 @@ static const struct debug_named_value agx_debug_options[] = {
    {"nomerge",   AGX_DBG_NOMERGE,  "Disable control stream merging"},
    {"faulttrace",AGX_DBG_FAULTTRACE,"Retain G18 failure diagnostics"},
    {"asynctrace",AGX_DBG_ASYNCTRACE,"Trace command streams without waiting"},
+   {"verify",    AGX_DBG_VERIFY,   "Check cached launch programs against fresh ones"},
    {"bodumpverbose", AGX_DBG_BODUMPVERBOSE,   "Include extra info with dumps"},
    DEBUG_NAMED_VALUE_END
 };
@@ -1049,14 +1050,6 @@ agx_open_device(void *memctx, struct agx_device *dev)
       goto fail;
    }
 
-   if (agx_params_fixup_upstream_uapi(&dev->params) &&
-       (dev->debug & AGX_DBG_PERF))
-      fprintf(stderr,
-              "AGX: kernel publishes the upstream UAPI parameters; features "
-              "masked to %#llx, USC %u, HAL %u\n",
-              (unsigned long long)dev->params.features,
-              dev->params.usc_generation, dev->params.gpu_hal_generation);
-
    dev->chip = agx_chip_from_params(&dev->params);
 
    /*
@@ -1146,10 +1139,6 @@ agx_open_device(void *memctx, struct agx_device *dev)
          break;
       case 'C':
          variant = " Max";
-         break;
-      case 'X':
-         if (dev->params.chip_id == 0x6041)
-            variant = " Max";
          break;
       case 'D':
          variant = " Ultra";

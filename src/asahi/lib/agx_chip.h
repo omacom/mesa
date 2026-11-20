@@ -48,7 +48,17 @@ enum agx_chip {
    AGX_CHIP_G16C,
 
    /* G17P/G17A remain on the HAL200/AGX3b side of the boundary. The M5
-    * G/S/C parts use AGX3c. */
+    * G/S/C parts use AGX3c.
+    *
+    * G17P is an instruction-set and firmware-HAL profile (AGX3b shaders,
+    * HAL200 firmware interface), not one SoC. agx_chip_from_params() maps
+    * three SoCs to it: the A18 Pro (T8140, one cluster), the M4 Pro (T6040)
+    * and the M4 Max (T6041). They share the encodings, so encoding gates on
+    * G17P are exact. They differ in cluster and core counts, caches and
+    * clocks, so a performance or tuning gate on G17P is only as good as the
+    * rows behind it: give it measurements on its members (at least the A18
+    * Pro and the M4 Pro), or select it by the hardware property that is the
+    * real reason. */
    AGX_CHIP_G17P,
    AGX_CHIP_G17A,
    AGX_CHIP_G17G,
@@ -517,19 +527,25 @@ agx_chip_cdm_wide_visibility(enum agx_chip chip)
    return agx_chip_native_g15(chip);
 }
 
+/* M5 variants sharing the AGX3C instruction and HAL300 command formats. */
+static inline bool
+agx_chip_g17_m5(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
+          chip == AGX_CHIP_G17C;
+}
+
 /* Whether consecutive application dispatches of one CDM stream may omit the
  * ordering barrier between them.  Vulkan orders dispatches only through
  * explicit barriers; every other record (internal or indirect launch, cache
- * flush, link, stream end) still follows a barrier.  On the M5 Max (G17C)
- * the barrier holds the next launch until every kernel launched before it
- * has finished; without it the threadgroups of consecutive launches run
- * side by side.  The M4 Pro (G17P) takes the same rule.  G17G and G17S keep
- * the barrier: the change is not measured there. */
+ * flush, link, stream end) still follows a barrier.  On the native AGX3 CDM
+ * (G15, HAL200 and M5 HAL300) the barrier holds the next launch until every
+ * kernel launched before it has finished; without it the threadgroups of
+ * consecutive launches run side by side. */
 static inline bool
 agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
 {
-   return agx_chip_native_g15(chip) || chip == AGX_CHIP_G17C ||
-          chip == AGX_CHIP_G17P;
+   return agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip);
 }
 
 /* Number of helper-table slots in the USC code-container lead block.  G15
@@ -606,7 +622,7 @@ agx_chip_uncovered_tile_ms_defect(enum agx_chip chip)
 
 /*
  * Whether that defect also reaches a reloaded attachment, which must then
- * spill. On M4 Pro (T6040, chip id 0x6040) a 2x reload keeps the whole sample:
+ * spill. On M4 Pro and M4 Max (chip ids 0x6040, 0x6041) a 2x reload keeps the whole sample:
  * kept in the tilebuffer, 149 runs of 12- and 16-byte samples passed (64x64
  * to 3456x2234, 1 to 16 layers, partly drawn tiles, every empty tile
  * processed), where the same runs at 4x lost the upper bytes in 40 of 102.
@@ -616,7 +632,8 @@ static inline bool
 agx_chip_uncovered_tile_ms_reload_defect(enum agx_chip chip, uint32_t chip_id,
                                          unsigned samples)
 {
-   if (chip == AGX_CHIP_G17P && chip_id == 0x6040 && samples == 2)
+   if (chip == AGX_CHIP_G17P && (chip_id == 0x6040 || chip_id == 0x6041) &&
+       samples == 2)
       return false;
    return agx_chip_uncovered_tile_ms_defect(chip);
 }
@@ -728,8 +745,6 @@ bool agx_params_m5_supported(
 bool agx_params_native_kernel_abi_supported(
    const struct drm_asahi_params_global *params);
 
-bool agx_params_fixup_upstream_uapi(struct drm_asahi_params_global *params);
-
 /* Exact product name when the chip identity maps to one unambiguous SoC.
  * Variant letters are not marketing tiers: notably, G17P is A18 Pro rather
  * than an M5 variant. Returns NULL when one chip identity spans products. */
@@ -740,14 +755,6 @@ bool agx_chip_uses_legacy_precompiled_programs(enum agx_chip chip);
 bool agx_chip_has_hardware_ray_tracing(enum agx_chip chip);
 
 bool agx_chip_needs_scheduling_stalls(enum agx_chip chip);
-
-/* M5 variants sharing the AGX3C instruction and HAL300 command formats. */
-static inline bool
-agx_chip_g17_m5(enum agx_chip chip)
-{
-   return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
-          chip == AGX_CHIP_G17C;
-}
 
 /* Every AGX3B part carries the 8x8 f16/f32 matmad backing a subgroup-scope
  * cooperative matrix. M5 has its own AGX3C encoding and matrix16 support. */
@@ -763,8 +770,6 @@ const char *agx_chip_name(enum agx_chip chip);
 
 /* Stable name for the instruction set, e.g. "AGX3". Never NULL. */
 const char *agx_isa_name(enum agx_isa isa);
-
-const char *agx_isa_encoding_name(enum agx_isa_encoding encoding);
 
 const char *agx_command_stream_generation_name(
    enum agx_command_stream_generation generation);

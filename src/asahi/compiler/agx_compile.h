@@ -179,6 +179,14 @@ struct agx_shader_info {
     * The main shader is at offset main_offset. The preamble is executed first.
     */
    bool has_preamble;
+   /* The program performs an atomic on global memory (buffer, image or
+    * device-address atomics). Submit packing keeps such programs apart where
+    * another kernel queue could run beside them (hk_queue.c). */
+   bool uses_global_atomics;
+   /* The program (main or preamble) contains a loop, so its run time is not
+    * bounded by its static instruction count. Submit packing keeps at most
+    * one such stream per packed command (hk_pack.c). */
+   bool has_loops;
    /* Native constant-program live-ins. External G17P launch needs the
     * uniform-input prelude when a uniform half is read before definition. */
    bool agx3_preamble_uniform_inputs;
@@ -549,6 +557,14 @@ struct agx_shader_key {
     */
    bool no_preamble;
 
+   /* Buffer accesses are bounds-checked in software on their 32-bit offset
+    * (robustBufferAccess, robustBufferAccess2, a GL robust context). That
+    * check tests the offset modulo 2^32, so an access may only be addressed
+    * at that same value: array index products (amul) and no-wrap flags are
+    * not proof that the offset arithmetic does not wrap.
+    */
+   bool checked_offsets;
+
    /* A complete, single-sample M5 uniform-colour blend variant. The packer
     * still proves its one read/write pixel transaction before admitting it. */
    bool m5_uniform_blend;
@@ -736,14 +752,12 @@ bool agx_nir_lower_sample_mask_one_update_m5(nir_shader *s);
 bool agx_nir_lower_sample_mask_deferred_g17p(nir_shader *s, bool *a2c_in_main);
 bool agx_nir_lower_sample_mask_deferred_m5(nir_shader *s);
 bool agx_nir_lower_interpolation(nir_shader *s, bool layer_as_varying);
-bool agx_nir_fix_g17g_constant_interpolation(nir_shader *s);
 
 bool agx_nir_lower_clip_m1_1(struct nir_shader *s);
 bool agx_nir_clip_m1_1_complete(struct nir_shader *s);
 bool agx_nir_lower_cull_distance_vs(struct nir_shader *s);
 bool agx_nir_lower_cull_distance_fs(struct nir_shader *s,
-                                    unsigned nr_distances,
-                                    bool native_constant_planes);
+                                    unsigned nr_distances);
 bool agx_mem_vectorize_cb(unsigned align_mul, unsigned align_offset,
                           unsigned bit_size, unsigned num_components,
                           int64_t hole_size, nir_intrinsic_instr *low,

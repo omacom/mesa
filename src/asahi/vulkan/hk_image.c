@@ -39,12 +39,6 @@
  */
 #define HK_SPARSE_ALIGN_B 65536
 
-DEBUG_GET_ONCE_BOOL_OPTION(m5_depth_msaa_transfer,
-                          "ASAHI_M5_DEPTH_MSAA_TRANSFER", true)
-
-DEBUG_GET_ONCE_BOOL_OPTION(m5_depth_msaa_compression,
-                          "ASAHI_M5_DEPTH_MSAA_COMPRESSION", true)
-
 static VkFormatFeatureFlags2
 hk_get_image_plane_format_features(struct hk_physical_device *pdev,
                                    VkFormat vk_format, VkImageTiling tiling)
@@ -394,10 +388,6 @@ vk_image_usage_to_format_features(VkImageUsageFlagBits usage_flag)
    }
 }
 
-/* Enable the validated multisample color layouts on G17S. */
-DEBUG_GET_ONCE_NUM_OPTION(m5_msaa_color_compression,
-                         "ASAHI_M5_MSAA_COLOR_COMPRESSION", 6)
-
 static bool
 hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
                 unsigned width, unsigned height, unsigned samples,
@@ -567,11 +557,23 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
       ext->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO &&
       !ext->pNext;
 
-   /* G17P storage images stay uncompressed. hk does not initialize the
-    * compression metadata of a storage image whose contents are discarded
-    * (a transition from UNDEFINED), so an image bound to memory that held
-    * other data keeps that memory's tile words, and reads back wrong texels
-    * even after shader stores have written every texel. */
+   /* G17P storage images stay uncompressed: a shader image store through
+    * the G17P PBE does not merge into a compressed block or update its
+    * metadata. It writes the block as the block's existing metadata says,
+    * so the image decodes wrong whatever that metadata is:
+    *  - tiles a render pass or fast clear left compressed: with this rule
+    *    admitted on G17P (M4 Pro, 11-05) every format failed the scattered
+    *    imageStore steps of tests/vulkan_storage_compression.c, also without
+    *    a fast clear; a solid-mode block took the last stored value in all
+    *    of its texels.
+    *  - metadata left in reused memory (Neo, 11-12/13): images of the
+    *    half-float, R32F and RG32F formats that otherwise passed, written in
+    *    full by imageStore after a transition from UNDEFINED, read back
+    *    wrong, and RGBA8 images still did with their metadata reset.
+    * Initializing metadata on UNDEFINED would therefore not make the image
+    * correct once any other writer compresses its tiles. The storage PBE
+    * descriptor is byte-identical to the end-of-tile one, so there is no
+    * descriptor bit to fix this with. */
    if (dev->chip == AGX_CHIP_G17P)
       return false;
 
@@ -653,10 +655,10 @@ hk_float_image_atomics(const struct hk_device *dev)
 
 /* Compressed data is only decodable through its own channel class. Every
  * G17P/M5 writer of a colour image is a PBE; the end-of-tile PBE may store a
- * different format from the image (hk_eot_pbe_format(): G17P packs
- * R11G11B10/RGB9E5 into R32_UINT words, M4 Pro and M5 store R11G11B10 in its
- * own class). Never compress an image whose store class would differ from the
- * class its textures read. */
+ * different format from the image (hk_eot_pbe_format(): G17P packs RGB9E5
+ * into R32_UINT words, G17P and M5 store R11G11B10 in its own class). Never
+ * compress an image whose store class would differ from the class its
+ * textures read. */
 static bool
 hk_g17p_store_class_matches(const struct agx_device *dev, VkFormat format)
 {
@@ -1336,19 +1338,14 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
    const bool m5_storage =
       hk_m5_storage_compression_eligible(dev, plane, info, float_image_atomics);
    bool allow_agx3 =
-      hk_m5_msaa_color_compression_eligible(
-         dev->chip, plane, info,
-         debug_get_option_m5_msaa_color_compression()) ||
-      hk_m5_depth_msaa_compression_eligible(
-         dev->chip, plane, info, dev->params.features,
-         debug_get_option_m5_depth_msaa_compression()) ||
-      hk_m5_depth_msaa_transfer_eligible(
-         dev->chip, plane, info, dev->params.features,
-         debug_get_option_m5_depth_msaa_compression(),
-         debug_get_option_m5_depth_msaa_transfer()) ||
+      hk_m5_msaa_color_compression_eligible(dev->chip, plane, info) ||
+      hk_m5_depth_msaa_compression_eligible(dev->chip, plane, info,
+                                            dev->params.features) ||
+      hk_m5_depth_msaa_transfer_eligible(dev->chip, plane, info,
+                                         dev->params.features) ||
       m5_storage ||
-      (hk_hal200_compression_eligible(dev->chip, plane, info,
-                                      agx_is_m4_pro(dev)) &&
+      (hk_hal200_compression_eligible(dev->chip, dev->params.chip_id, plane,
+                                      info, agx_is_m4_pro(dev)) &&
        !hk_g17p_multiview_spill_risk(info, multiview)) ||
       hk_g17p_shared_compression_eligible(dev->chip, plane, info) ||
       hk_m5_color_compression_eligible(dev->chip, plane, info) ||

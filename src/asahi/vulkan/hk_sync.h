@@ -96,6 +96,17 @@ enum hk_sync_kind {
 
 #define HK_SYNC_NUM_KINDS 6
 
+/* The destination classes a stream of the given kinds belongs to: graphics
+ * work is in every graphics class (HK_SYNC_GFX_FRAG, HK_SYNC_GFX_IMG). A
+ * stream waits for the requirements carried in for each of them. */
+static inline uint8_t
+hk_sync_full_kinds(uint8_t kinds)
+{
+   return kinds & HK_SYNC_GFX
+             ? kinds | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG
+             : kinds;
+}
+
 /* Subqueue index: 0 render (VDM), 1 compute (CDM). */
 enum hk_sync_sq {
    HK_SYNC_VDM = 0,
@@ -230,7 +241,10 @@ struct hk_sync_stream {
    struct hk_cs *prev_mem;
 
    /* Set at submission: 1-based position among the commands of this
-    * subqueue in the ioctl being built. */
+    * subqueue in the ioctl being built. Like the resolved fields below, it
+    * describes one occurrence of the stream: a simultaneous-use command
+    * buffer may occur more than once in a submission
+    * (hk_sync_resolve_submit()). */
    uint32_t index;
 
    /* Resolved barrier fields for the ioctl being built. */
@@ -257,6 +271,15 @@ struct hk_sync_stream {
     * dependency epoch vtx_images_epoch. */
    bool vtx_images;
    uint32_t vtx_images_epoch;
+};
+
+/* The resolved fields of one occurrence of a stream in a submission. */
+struct hk_sync_resolved {
+   uint16_t barrier[HK_SYNC_NUM_SQ];
+   uint16_t barrier_ta[HK_SYNC_NUM_SQ];
+   uint64_t prior[HK_SYNC_NUM_SQ];
+   uint64_t prior_ta[HK_SYNC_NUM_SQ];
+   bool ta_split;
 };
 
 /* Per-command-buffer state. */
@@ -354,7 +377,7 @@ struct hk_sync_queue {
    bool serialize;
    /* Serialized queue that still records dependencies so a render whose
     * vertex half depends on no earlier render can order only its fragment
-    * half after the serialized prefix (HK_G13_STAGE_OVERLAP=0 disables). */
+    * half after the serialized prefix. */
    bool stage_overlap;
    uint64_t submitted[HK_SYNC_NUM_SQ];
    uint64_t last_absolute[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
@@ -370,9 +393,11 @@ struct hk_sync_queue {
    struct hk_sync_recent recent[HK_SYNC_RECENT_FOOTPRINTS];
    uint32_t recent_next, recent_count;
    uint64_t recent_max, evicted;
-   /* G16S: complete writes need no preservation query against other
-    * complete writes, including entries evicted from the bounded ring.
-    * Retain all writes for a future partial-tile or sparse-layer pass.
+   /* Complete writes need no preservation query against other complete
+    * writes, including entries evicted from the bounded ring: only a
+    * preserving footprint shares a tile (footprints_share_tile()). Retain
+    * all writes for a future partial-tile or sparse-layer pass. Always set
+    * by hk_queue_create(); tests clear it to cover the conservative path.
     */
    bool precise_tile_evictions;
    /* A single command buffer already owns the complete footprint list. */
@@ -517,8 +542,24 @@ void hk_sync_resolve_end(struct hk_cmd_buffer *cmd);
  * command must run after; chain_first says the commands must transitively
  * follow the first hardware command (the kernel attaches the ioctl's input
  * syncs only to it).
+ *
+ * A command buffer may occur more than once in cmdbufs, and its streams then
+ * resolve differently at each occurrence. Unless out is NULL, it receives
+ * one entry per stream occurrence in submission order; the caller loads each
+ * into its stream (hk_sync_load_resolved()) before emitting it. The streams
+ * keep the fields of their last occurrence.
  */
 bool hk_sync_resolve_submit(struct hk_queue *queue,
                             struct hk_cmd_buffer *const *cmdbufs,
                             unsigned count, bool first_cdm_is_flush,
-                            bool chain_first, uint64_t completed);
+                            bool chain_first, uint64_t completed,
+                            struct hk_sync_resolved *out);
+
+/* The kinds whose priors on subqueue `sq` hk_sync_resolve_submit() resolves
+ * to a wait, at the first command buffer of the next submission on `q`: a
+ * prior of any other kind is no wait. Each command buffer adds
+ * hk_sync_cmd_kinds() for those after it in the submission. A driver-added
+ * flush opening the payload (first_cdm_is_flush) is not counted. */
+uint8_t hk_sync_queue_kinds(const struct hk_sync_queue *q, unsigned sq);
+uint8_t hk_sync_cmd_kinds(const struct hk_cmd_buffer *cmd, unsigned sq);
+void hk_sync_load_resolved(struct hk_cs *cs, const struct hk_sync_resolved *r);

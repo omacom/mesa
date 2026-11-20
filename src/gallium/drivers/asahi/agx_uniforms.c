@@ -17,7 +17,7 @@ agx_const_buffer_ptr(struct agx_batch *batch, struct pipe_constant_buffer *cb)
 {
    if (cb->buffer) {
       struct agx_resource *rsrc = agx_resource(cb->buffer);
-      agx_batch_reads(batch, rsrc);
+      agx_batch_reads_range(batch, rsrc, cb->buffer_offset, cb->buffer_size);
       return agx_map_gpu(rsrc) + cb->buffer_offset;
    } else {
       return 0;
@@ -55,13 +55,6 @@ agx_upload_vbos(struct agx_batch *batch)
          attribs->key[i].stride, attribs->src_offsets[i], &addr);
 
       batch->uniforms.attrib_base[i] = addr;
-      if (agx_env_flag(AGX_ENV_NEO_UNIFORM_DIAGNOSTICS) &&
-          attribs->key[i].format != PIPE_FORMAT_NONE)
-         fprintf(stderr, "NEO_VBO attrib=%u buffer=%u gpu=%#llx source_gpu=%#llx size=%zu offset=%u stride=%u divisor=%u clamp=%u\n",
-                 i, buf, (unsigned long long)addr,
-                 (unsigned long long)buffers[buf], buf_sizes[buf],
-                 attribs->src_offsets[i], attribs->key[i].stride,
-                 attribs->key[i].divisor, batch->uniforms.attrib_clamp[i]);
    }
 }
 
@@ -206,11 +199,6 @@ agx_set_cbuf_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
    u_foreach_bit(cb, st->cb_mask) {
       unif->ubo_base[cb] = agx_const_buffer_ptr(batch, &st->cb[cb]);
       unif->ubo_size[cb] = st->cb[cb].buffer_size;
-      if (agx_env_flag(AGX_ENV_NEO_UNIFORM_DIAGNOSTICS))
-         fprintf(stderr, "NEO_UBO stage=%u cb=%u gpu=%#llx offset=%u size=%u backed=%u\n",
-                 stage, cb, (unsigned long long)unif->ubo_base[cb],
-                 st->cb[cb].buffer_offset, st->cb[cb].buffer_size,
-                 st->cb[cb].buffer != NULL);
    }
 }
 
@@ -238,7 +226,8 @@ agx_set_ssbo_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
                                    sb->buffer_size);
             batch->incoherent_writes = true;
          } else {
-            agx_batch_reads(batch, rsrc);
+            agx_batch_reads_range(batch, rsrc, sb->buffer_offset,
+                                  sb->buffer_size);
          }
 
          unif->ssbo_base[cb] = agx_map_gpu(rsrc) + sb->buffer_offset;

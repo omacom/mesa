@@ -79,6 +79,9 @@ enum agx_dbg {
    AGX_DBG_FAULTTRACE = BITFIELD_BIT(23),
    /* Decode every command stream at submit time without waiting for the GPU. */
    AGX_DBG_ASYNCTRACE = BITFIELD_BIT(24),
+   /* Check cached native launch programs and root snapshots against a fresh
+    * computation. */
+   AGX_DBG_VERIFY = BITFIELD_BIT(25),
 };
 
 /* How many power-of-two levels in the BO cache do we want? 2^14 minimum chosen
@@ -581,15 +584,6 @@ agx_is_m4_pro(const struct agx_device *dev)
 {
    return dev->chip == AGX_CHIP_G17P && dev->params.chip_id == 0x6040 &&
           dev->params.gpu_generation == 16 && dev->params.gpu_variant == 'S';
-}
-
-/* Product capability rollout must not follow the shared G17P architecture
- * profile: T6040 also uses that profile. Device admission checked USC/HAL. */
-static inline bool
-agx_is_a18_pro(const struct agx_device *dev)
-{
-   return dev->chip == AGX_CHIP_G17P && dev->params.chip_id == 0x8140 &&
-          dev->params.gpu_generation == 17 && dev->params.gpu_variant == 'P';
 }
 
 struct agx_va *agx_va_alloc(struct agx_device *dev, uint64_t size_B,

@@ -194,8 +194,6 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
    hk_descriptor_state_fini(cmd, &cmd->state.cs.descriptors);
    hk_descriptor_state_fini(cmd, &cmd->state.rt.descriptors);
 
-   hk_cmd_pool_free_gen1_as_chunks(pool, &cmd->gen1_as_table_chunks);
-
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_MAIN, &cmd->uploader.main.bos);
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_USC, &cmd->uploader.usc.bos);
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_ROOT, &cmd->uploader.root.bos);
@@ -271,7 +269,6 @@ hk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    list_inithead(&cmd->uploader.usc.bos);
    list_inithead(&cmd->uploader.root.bos);
    list_inithead(&cmd->vdm_allocations);
-   list_inithead(&cmd->gen1_as_table_chunks);
    list_inithead(&cmd->control_streams);
 
    *cmd_buffer_out = &cmd->vk;
@@ -662,78 +659,6 @@ hk_cmd_buffer_emit_cs_jump(struct hk_cmd_buffer *cmd, void *current,
    return current;
 }
 
-int hk_g17p_launch_trace_state = -1;
-
-int
-hk_g17p_launch_trace_init(void)
-{
-   const int enabled = debug_get_bool_option("HK_G17P_LAUNCH_TRACE", false) ? 1 : 0;
-   hk_g17p_launch_trace_state = enabled;
-   return enabled;
-}
-
-/* Single line, distinct tag. The multi-line dump below has twice been reported
- * as "only the header printed", so anything that must not be lost in a log
- * filter goes through this instead. */
-void
-hk_g17p_trace_line(const char *label, uint64_t base, const void *data,
-                   size_t len)
-{
-   const uint8_t *bytes = data;
-   fprintf(stderr, "G17P %s: base=%" PRIx64 " len=%zu bytes=", label, base,
-           len);
-   for (size_t i = 0; i < len; ++i)
-      fprintf(stderr, "%02x", bytes[i]);
-   fprintf(stderr, "\n");
-   fflush(stderr);
-}
-
-void
-hk_g17p_trace_hexdump(const char *label, uint64_t base, const void *data,
-                      size_t len)
-{
-   const uint8_t *bytes = data;
-   fprintf(stderr, "G17P dump: %s base=%" PRIx64 " len=%zu\n", label, base,
-           len);
-   for (size_t off = 0; off < len; off += 16) {
-      fprintf(stderr, "G17P dump:   +%04zx ", off);
-      for (size_t i = 0; i < 16 && off + i < len; ++i)
-         fprintf(stderr, "%02x ", bytes[off + i]);
-      fprintf(stderr, "\n");
-   }
-   fflush(stderr);
-}
-
-/* w74: HK_G17P_LAUNCH_TRACE=1 dump of one graphics stage's uniform ranges, one
- * line per range. A draw's texture/descriptor/root bindings reach the shader
- * only through these ranges, so this is what to compare with the shader's
- * load_preamble/device_load bases in the AGX3 dump. */
-static void
-hk_g17p_trace_gfx_ranges(const struct hk_shader *s,
-                         const struct agx3_ioto_uniform_range *ranges,
-                         size_t count, const uint8_t *sources)
-{
-   fprintf(stderr,
-           "G17P gfx-ranges: stage=%d count=%zu root_uniform=%u set_count=%u "
-           "uses_root=%d combined_sampler=%d indexed_sampler=%d "
-           "rodata16=%u uniform_dma=%u push_count=%u\n",
-           (int)s->info.stage, count, s->info.agx3_root_uniform,
-           (unsigned)s->info.set_count, (int)s->info.agx3_uses_root,
-           (int)s->info.agx3_combined_sampler_valid,
-           (int)s->info.agx3_indexed_sampler_valid,
-           (unsigned)s->b.info.rodata.size_16,
-           (unsigned)s->b.info.agx3_uniform_dma_count,
-           (unsigned)s->b.info.push_count);
-   for (size_t i = 0; i < count; ++i)
-      fprintf(stderr,
-              "G17P gfx-range: stage=%d i=%zu start_halfs=%u size_halfs=%u "
-              "address=%" PRIx64 " source=%u\n",
-              (int)s->info.stage, i, (unsigned)ranges[i].start_halfs,
-              (unsigned)ranges[i].size_halfs, (uint64_t)ranges[i].address,
-              (unsigned)sources[i]);
-   fflush(stderr);
-}
-
 void *
 hk_cmd_buffer_emit_cdm_terminate(struct hk_cmd_buffer *cmd, void *current)
 {
@@ -852,7 +777,7 @@ merge_control_streams(struct hk_cmd_buffer *cmd)
 
    list_for_each_entry_safe(struct hk_cs, cs, &cmd->control_streams, node) {
       /* G18G CDM streams never merge: launches would add past the
-       * HK_G18_BATCH cap and hk_cs_merge_cdm does not combine
+       * HK_G18_BATCH_LAUNCHES cap and hk_cs_merge_cdm does not combine
        * g18_compute_resources, so the merged command would keep only the
        * first stream's registers, staging and local size. */
       if (cs->type == HK_CS_CDM && last && last->type == HK_CS_CDM && !g18 &&
@@ -1211,8 +1136,20 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     * scope (hk_cdm_alias_scope()). */
    struct hk_cs *cs = cmd->current_cs.cs;
    const bool alias_scope = hk_cdm_alias_scope(dev);
-   if (cs && (src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER)) && dst_kinds &&
-       hk_cdm_visibility_flush_needed(dev, cs, alias_scope)) {
+   if (cs && HK_PERF(dev, WEAKBARRIER) && !alias_scope &&
+       src_kinds && !(src_kinds & ~(HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
+       dst_kinds && !(dst_kinds & ~(HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
+       !hk_sync_xfer_pending(&cmd->sync) &&
+       !hk_dependency_has_host_access(pDependencyInfo) &&
+       (cs->current == cs->weak_barrier_end ||
+        !hk_cdm_visibility_flush_needed(dev, cs, alias_scope))) {
+      /* Keep the preceding launch's weak ordering record in place (do not let
+       * the next application dispatch elide it) and skip the flags-5 cache
+       * flush when testing ordering-only compute barriers. */
+      cs->app_dispatch_end = NULL;
+   } else if (cs && (src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
+              dst_kinds &&
+              hk_cdm_visibility_flush_needed(dev, cs, alias_scope)) {
       hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
       hk_cdm_visibility_flush(dev, cs, alias_scope);
    }
@@ -1756,13 +1693,6 @@ hk_CmdPushDescriptorSetWithTemplate2KHR(
       push_set, set_layout, template,
       pPushDescriptorSetWithTemplateInfo->pData);
 }
-
-DEBUG_GET_ONCE_BOOL_OPTION(m5_fragment_root_memo, "ASAHI_M5_FRAGMENT_ROOT_MEMO",
-                           true)
-DEBUG_GET_ONCE_BOOL_OPTION(m5_fragment_root_shadow,
-                           "ASAHI_M5_FRAGMENT_ROOT_SHADOW", true)
-DEBUG_GET_ONCE_BOOL_OPTION(m5_verify_fragment_root_shadow,
-                           "ASAHI_M5_VERIFY_FRAGMENT_ROOT_SHADOW", false)
 
 static uint64_t
 hk_upload_native_spilled_rt_descs(struct hk_cmd_buffer *cmd)
@@ -2785,42 +2715,6 @@ hk_g17p_graphics_uniform_ranges(
       if (!pointers_va)
          return hk_g17p_graphics_ranges_refused(range_count, count);
 
-      if (hk_g17p_launch_trace_enabled()) {
-         /* Descriptor bytes as the set holds them, the texture state the
-          * hardware will actually read (the 32-byte aligned copy), and the
-          * sampler heap element the shader's sampler index selects. */
-         const uint8_t *tex_src =
-            (const uint8_t *)set_map + binding->texture_offset_B;
-         hk_g17p_trace_line("gfx-combined-set-texture", set_addr +
-                               binding->texture_offset_B, tex_src,
-                            MIN2(set_size - binding->texture_offset_B,
-                                 (uint32_t)sizeof(struct hk_sampled_image_descriptor)));
-         fprintf(stderr,
-                 "G17P gfx-combined: set_addr=%" PRIx64 " set_size=%u "
-                 "texture_offset_B=%u sampler_index_offset_B=%u "
-                 "sampler_index=%u sampler_count=%u sampler_elem_B=%u "
-                 "tex_ptr_in=%" PRIx64 " tex_ptr_published=%" PRIx64
-                 " sampler_heap_va=%" PRIx64 " pointers_va=%" PRIx64 "\n",
-                 set_addr, set_size, binding->texture_offset_B,
-                 binding->sampler_index_offset_B, (unsigned)sampler_index,
-                 (unsigned)dev->samplers.table.alloc, sampler_element_size,
-                 pointers[0], cached->valid ? cached->published[0] : 0,
-                 pointers[1], pointers_va);
-         if (sampler_index < dev->samplers.table.alloc)
-            hk_g17p_trace_line(
-               "gfx-combined-sampler-element",
-               dev->samplers.table.bo->va->addr +
-                  (uint64_t)sampler_index * sampler_element_size,
-               hk_descriptor_table_entry(&dev->samplers.table, sampler_index),
-               sampler_element_size);
-         if (cached->valid && cached->published[0])
-            fprintf(stderr, "G17P gfx-combined: texture state %s 32-byte "
-                            "aligned\n",
-                    (cached->published[0] & (HK_G17P_TEXTURE_STATE_ALIGN - 1))
-                       ? "NOT" : "is");
-         fflush(stderr);
-      }
-
       sources[count] = HK_G17P_RANGE_SOURCE_UPLOADED;
       ranges[count++] = (struct agx3_ioto_uniform_range){
          .start_halfs = texture_uniform_base,
@@ -2842,17 +2736,6 @@ hk_g17p_graphics_uniform_ranges(
           !dev->rodata.indexed_heap_pointers)
          return hk_g17p_graphics_ranges_refused(range_count, count);
       const uint64_t pointers_va = dev->rodata.indexed_heap_pointers;
-      if (hk_g17p_launch_trace_enabled())
-         fprintf(stderr,
-                 "G17P gfx-indexed: sampled_images_base_va=%" PRIx64
-                 " sampled_image_desc_size=%u sampled_images_alloc=%u "
-                 "sampler_heap_va=%" PRIx64 " sampler_alloc=%u "
-                 "heap_pointers_va=%" PRIx64 "\n",
-                 dev->sampled_images.base_va,
-                 (unsigned)dev->sampled_images.desc_size,
-                 (unsigned)dev->sampled_images.alloc,
-                 dev->samplers.table.bo->va->addr,
-                 (unsigned)dev->samplers.table.alloc, pointers_va);
       sources[count] = HK_G17P_RANGE_SOURCE_CONSTANT;
       ranges[count++] = (struct agx3_ioto_uniform_range){
          .start_halfs = texture_uniform_base, .size_halfs = 8, .address = pointers_va,
@@ -2908,8 +2791,6 @@ hk_g17p_graphics_uniform_ranges(
                            HK_AGX3_G17P_GRAPHICS_MAX_RANGES, &count, sources))
       return hk_g17p_graphics_ranges_refused(range_count, count);
 
-   if (hk_g17p_launch_trace_enabled())
-      hk_g17p_trace_gfx_ranges(s, ranges, count, sources);
    *range_count = count;
    return count <= HK_AGX3_G17P_GRAPHICS_MAX_RANGES;
 }
@@ -3510,8 +3391,9 @@ refused:
    return 0;
 }
 
-/* Read the uncached mappings only for this opt-in validation oracle. Keep
- * its temporary snapshot and checks out of the normal recording path. */
+/* Read the uncached mappings only for this validation oracle
+ * (ASAHI_MESA_DEBUG=verify). Keep its temporary snapshot and checks out of
+ * the normal recording path. */
 __attribute__((cold, noinline)) static void
 hk_m5_verify_fragment_root_shadow(const struct hk_graphics_state *gfx)
 {
@@ -3544,15 +3426,13 @@ hk_m5_verify_fragment_root_shadow(const struct hk_graphics_state *gfx)
 static uint64_t
 hk_m5_fragment_root(struct hk_cmd_buffer *cmd, const struct hk_shader *s)
 {
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
-   const bool shadow = debug_get_option_m5_fragment_root_shadow();
 
-   if (unlikely(shadow && debug_get_option_m5_verify_fragment_root_shadow()))
+   if (unlikely(dev->dev.debug & AGX_DBG_VERIFY))
       hk_m5_verify_fragment_root_shadow(gfx);
 
-   return hk_m5_fragment_root_select(gfx, s->info.agx3_root_reads,
-                                     debug_get_option_m5_fragment_root_memo(),
-                                     shadow);
+   return hk_m5_fragment_root_select(gfx, s->info.agx3_root_reads, true, true);
 }
 
 static uint64_t

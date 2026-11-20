@@ -82,13 +82,6 @@ hk_g17p_cached_cmd_memory(const struct agx_device *dev)
 }
 
 struct hk_cmd_pool;
-struct hk_gen1_as_table_chunk;
-void hk_device_finish_gen1_as_chunks(struct hk_device *dev);
-VkResult hk_cmd_pool_alloc_gen1_as_chunk(struct hk_cmd_pool *pool,
-                                          uint32_t count,
-                                          struct hk_gen1_as_table_chunk **out);
-void hk_cmd_pool_free_gen1_as_chunks(struct hk_cmd_pool *pool,
-                                      struct list_head *chunks);
 
 void hk_cmd_pool_clean_vdm(const struct hk_vdm_allocation *allocation);
 
@@ -115,8 +108,6 @@ struct hk_cmd_pool {
    /** Spans likewise, so a warm small recording skips the device lock. */
    struct list_head free_spans[HK_CMD_BO_TYPE_COUNT];
    uint32_t num_free_spans[HK_CMD_BO_TYPE_COUNT];
-   struct list_head free_gen1_as_chunks[2];
-   uint32_t num_free_gen1_as_chunks[2];
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_cmd_pool, vk.base, VkCommandPool,
@@ -149,13 +140,19 @@ void hk_device_free_span(struct hk_device *dev,
                          struct hk_vdm_allocation *allocation);
 void hk_device_finish_vdm_slabs(struct hk_device *dev);
 
-/* Native M5 command-memory retirement, independent of API semaphores. */
+/* Command-memory retirement, independent of API semaphores: on native M5
+ * for the memory of every submitted recording, elsewhere only for a
+ * driver-owned buffer a submission reads (extra_bo, a packed compute
+ * stream), which goes back to the BO cache only once the submission
+ * retired. */
+struct agx_bo;
 struct hk_cmd_pending;
 struct hk_queue;
 struct vk_queue_submit;
 VkResult hk_cmd_pending_begin(struct hk_device *dev,
                                const struct vk_queue_submit *submit,
-                               unsigned chunks, struct hk_cmd_pending **out);
+                               unsigned chunks, struct agx_bo *extra_bo,
+                               struct hk_cmd_pending **out);
 uint32_t hk_cmd_pending_signal(struct hk_cmd_pending *pending);
 void hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *pending,
                         struct hk_queue *queue, VkResult result);

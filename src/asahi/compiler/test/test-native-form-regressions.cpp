@@ -5257,15 +5257,8 @@ TEST(NativeForms, M5NativeTriangleMeshProbeCompiles)
    agx_shader_key key={};key.dev.chip=AGX_CHIP_G17S;
    key.dev.encoding=AGX_ISA_ENCODING_AGX3C;key.no_preamble=true;
    agx_shader_part part={};
-   bool compiled=agx_compile_shader_nir(b.shader,&key,&part);
-   EXPECT_TRUE(compiled)<<agx_last_compile_refusal();
-   if(compiled){
-      printf("native-triangle-mesh binary=%u gprs=%u shared=%u scratch=%u\n",
-        part.info.binary_size,part.info.nr_gprs,part.info.local_size,part.info.scratch_size);
-      FILE *f=fopen("native-triangle-mesh.bin","wb");
-      if(f){fwrite(part.binary,1,part.info.binary_size,f);fclose(f);}
-      free(part.binary);
-   }
+   EXPECT_TRUE(agx_compile_shader_nir(b.shader,&key,&part))<<agx_last_compile_refusal();
+   free(part.binary);
    ralloc_free(b.shader);
 }
 
@@ -7143,4 +7136,65 @@ TEST(NativeForms, G17PArrayShadowConstantLodKeepsEncodableImmediates)
       EXPECT_EQ(I->src[1].type == AGX_INDEX_IMMEDIATE, c.immediate);
       ralloc_free(mem);
    }
+}
+
+/*
+ * AGX3B's 8-bit register fields accept halves 192..255 in the compose table,
+ * but its general register file ends at half 191 (192 halves). Bound 4-half
+ * (vec2 f32) operands to 188 and 2-half (vec2 f16) operands to 190 on AGX3B
+ * while preserving AGX3C's 252/254 bounds.
+ */
+TEST(NativeForms, Agx3bMatmad8x8EnforcesRegisterBounds)
+{
+   uint8_t out[14], length = 0;
+
+   struct agx3_matrix_mma8_desc f32_max = {
+      .dest = 188, .a = 188, .b = 188, .c = 188,
+      .input_type = AGX3_MATRIX_INPUT_F32,
+   };
+   EXPECT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &f32_max, out,
+                                       &length));
+
+   for (unsigned field = 0; field < 4; ++field) {
+      struct agx3_matrix_mma8_desc over = f32_max;
+      if (field == 0)
+         over.dest = 190;
+      else if (field == 1)
+         over.a = 190;
+      else if (field == 2)
+         over.b = 190;
+      else
+         over.c = 190;
+      EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &over, out,
+                                           &length)) << field;
+      EXPECT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3C, &over, out,
+                                          &length)) << field;
+   }
+
+   struct agx3_matrix_mma8_desc f16_max = {
+      .dest = 188, .a = 190, .b = 190, .c = 188,
+      .input_type = AGX3_MATRIX_INPUT_F16,
+   };
+   EXPECT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &f16_max, out,
+                                       &length));
+
+   struct agx3_matrix_mma8_desc f16_over = f16_max;
+   f16_over.a = 192;
+   EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &f16_over, out,
+                                        &length));
+   f16_over = f16_max;
+   f16_over.b = 192;
+   EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &f16_over, out,
+                                        &length));
+   f16_over = f16_max;
+   f16_over.dest = 192;
+   EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &f16_over, out,
+                                        &length));
+
+   struct agx3_matrix_mma8_desc agx3c_max = {
+      .dest = 252, .a = 254, .b = 254, .c = 252,
+      .input_type = AGX3_MATRIX_INPUT_F16,
+   };
+   EXPECT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3C, &agx3c_max, out,
+                                       &length));
 }
