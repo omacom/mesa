@@ -10,7 +10,8 @@
 struct nir_shader;
 struct nir_instr;
 
-bool agx_nir_lower_address(struct nir_shader *shader);
+bool agx_nir_lower_address(struct nir_shader *shader,
+                           bool fold_subformat_address);
 bool agx_nir_lower_algebraic_late(struct nir_shader *shader);
 bool agx_nir_cleanup_amul(struct nir_shader *shader);
 bool agx_nir_fuse_lea(struct nir_shader *shader);
@@ -22,6 +23,11 @@ bool agx_nir_lower_layer(struct nir_shader *s);
 bool agx_nir_lower_clip_distance(struct nir_shader *s);
 bool agx_nir_lower_subgroups(struct nir_shader *s);
 bool agx_nir_lower_fminmax(struct nir_shader *s);
+bool agx_nir_lower_fdiv(struct nir_shader *s);
+bool agx_nir_lower_fdiv_late(struct nir_shader *s);
+bool agx_nir_lower_log(struct nir_shader *s);
+bool agx_nir_lower_sincos(struct nir_shader *s);
+bool agx_nir_fold_shared_offsets(struct nir_shader *s);
 
 bool agx_nir_lower_texture_early(struct nir_shader *s, bool support_lod_bias);
 bool agx_nir_lower_texture(struct nir_shader *s);

@@ -303,6 +303,19 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
           "must end rendering before ending the command buffer");
 
    perf_debug(cmd, "End command buffer");
+
+   /* A barrier declared with no following launch in this command buffer still
+    * orders this buffer's writes against whatever runs next (the queue's next
+    * submission). Land it on the trailing edge of the open compute stream;
+    * with no trailing edge there is no local work to order.
+    */
+   if (cmd->state.cs.cdm_barrier_pending) {
+      cmd->state.cs.cdm_barrier_pending = false;
+      if (cmd->current_cs.cs) {
+         hk_cdm_cache_flush(hk_cmd_buffer_device(cmd), cmd->current_cs.cs);
+      }
+   }
+
    hk_cmd_buffer_end_compute(cmd);
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
 
@@ -336,10 +349,29 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    perf_debug(cmd, "Pipeline barrier");
 
-   /* The big hammer. We end both compute and graphics batches. Ending compute
-    * here is necessary to properly handle graphics->compute dependencies.
-    *
-    * XXX: perf. */
+   if (!HK_PERF(dev, ALWAYSCDMBARRIER) && !dev->cdm_defer_flush) {
+      /* The app declared a memory dependency: the next CDM launch carries the
+       * full barrier set (hk_cmd_dispatch.c). Compute launches before the
+       * barrier were already flushed by the previous launch's gating.
+       */
+      cmd->state.cs.cdm_barrier_pending = true;
+
+      /* Keep the compute batch open across the barrier only when it is the
+       * LAST control stream of the command buffer and no graphics batch is
+       * open. Streams are submitted in list order, each ordered after every
+       * stream listed before it. An older compute stream left open behind a
+       * later graphics stream would run before that graphics work, so the
+       * dispatch recorded after the barrier would read unrendered data. In
+       * that case end it, so the next dispatch starts a new tail stream. */
+      struct hk_cs *open_cs = cmd->current_cs.cs;
+      bool is_tail =
+         !open_cs ||
+         list_last_entry(&cmd->control_streams, struct hk_cs, node) == open_cs;
+      if (is_tail && !cmd->current_cs.gfx && !cmd->current_cs.pre_gfx &&
+          !cmd->current_cs.post_gfx)
+         return;
+   }
+
    hk_cmd_buffer_end_compute(cmd);
    hk_cmd_buffer_end_graphics(cmd);
 }
@@ -773,9 +805,24 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
 
    agx_usc_words_precomp(t.cpu, &prog->b, uploaded_data, data_size);
 
+   if (barrier & (AGX_PREGFX | AGX_POSTGFX))
+      hk_cmd_buffer_untrack_cdm(cmd);
+   /* An internal full-barrier launch orders in both directions: drain the
+    * producers before it, and it drains before the next CDM launch. The
+    * producer side is not tracked by cdm_barrier_pending, since an internal
+    * launch may consume the output of a regular launch (e.g. the TCS of the
+    * same draw) that sets no flag. */
+   if (barrier & AGX_BARRIER_ALL) {
+      hk_cdm_cache_flush(dev, cs);
+      cmd->state.cs.cdm_barrier_pending = false;
+   }
+
    hk_dispatch_with_usc_launch(dev, cs, prog->b.launch,
                                agx_usc_addr(&dev->dev, t.gpu), grid,
                                prog->b.workgroup);
+
+   if (barrier & AGX_BARRIER_ALL)
+      cmd->state.cs.cdm_barrier_pending = true;
 }
 
 void

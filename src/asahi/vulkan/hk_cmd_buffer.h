@@ -108,6 +108,10 @@ struct hk_root_descriptor_table {
       struct {
          uint64_t group_count_addr;
          uint32_t base_group[3];
+         uint32_t _pad;
+
+         /* Address of the bound shader's large-constant data, else 0 */
+         uint64_t const_data;
       } cs;
    };
 
@@ -120,6 +124,12 @@ struct hk_root_descriptor_table {
    /* Start index in dynamic_buffers where each set starts */
    uint8_t set_dynamic_buffer_start[HK_MAX_SETS];
 };
+
+/* cs shares a union with draw; growing it past draw would move every later
+ * root offset (push constants, dynamic buffers). */
+static_assert(sizeof(((struct hk_root_descriptor_table *)0)->cs) <=
+                 sizeof(((struct hk_root_descriptor_table *)0)->draw),
+              "root cs fields must fit in the draw union member");
 
 /* helper macro for computing root descriptor byte offsets */
 #define hk_root_descriptor_offset(member)                                      \
@@ -295,6 +305,21 @@ struct hk_graphics_state {
 struct hk_compute_state {
    struct hk_descriptor_state descriptors;
    struct hk_api_shader *shader;
+
+   /* Set by hk_CmdPipelineBarrier2, consumed by the next CDM launch, which
+    * then carries the full designed barrier set (dependency-tracked
+    * per-launch barrier). Lives on the command buffer, not the hk_cs, so it
+    * survives CS splits and merge_control_streams.
+    */
+   bool cdm_barrier_pending;
+
+   /* The command buffer recorded graphics or meta work (a render pass, an
+    * image copy, or a precomp launch that feeds or follows a draw). From then
+    * on every CDM launch is flushed as before: the consumers of those
+    * launches are draws and copies the app declares no barrier for, so the
+    * dependency tracking has nothing to key on.
+    */
+   bool untracked;
 };
 
 struct hk_cmd_push {
@@ -357,6 +382,11 @@ struct hk_cs {
 
    /* Whether there is more than just the root chunk */
    bool stream_linked;
+   /* Deferred CDM flush (hk_device.cdm_defer_flush): a launch was recorded
+    * without the trailing CDM barrier. It is emitted when the batch ends
+    * (Vulkan barrier, query, event, end of command buffer).
+    */
+   bool cdm_flush_pending;
 
    /* Whether the sampler heap is required. Although we always must maintain the
     * heap for correctness, it's often not necessary since we can push lots of
@@ -682,7 +712,21 @@ hk_cs_destroy(struct hk_cs *cs)
    free(cs);
 }
 
+/* Stop dependency-tracking the CDM barrier for the rest of this command
+ * buffer. Launches already recorded without a trailing flush are covered by
+ * the pending flag, which the next launch (or the end of the stream) consumes.
+ */
+static inline void
+hk_cmd_buffer_untrack_cdm(struct hk_cmd_buffer *cmd)
+{
+   if (!cmd->state.cs.untracked) {
+      cmd->state.cs.untracked = true;
+      cmd->state.cs.cdm_barrier_pending = true;
+   }
+}
+
 void hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+void hk_cs_finish_pending_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
 static void
 hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
@@ -690,6 +734,7 @@ hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
 {
    if (*ptr) {
       struct hk_cs *cs = *ptr;
+      hk_cs_finish_pending_flush(cmd, cs);
 
       /* This control stream may write immediates as it ends. Queue the writes
        * now that we're done emitting everything else.
