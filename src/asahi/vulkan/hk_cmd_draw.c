@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include <assert.h>
+#include <fenv.h>
 #include "agx_abi.h"
 #include "agx_bg_eot.h"
 #include "agx_bo.h"
@@ -7003,10 +7004,301 @@ hk_g17p_mono_disk_key(struct hk_device *dev, const struct hk_shader *shader,
    return true;
 }
 
+static bool
+hk_g16_host_eval_allowed(const struct hk_device *dev,
+                         const struct agx_fs_epilog_key *ekey)
+{
+   if (dev->dev.chip != AGX_CHIP_G16G || ekey->native_spills)
+      return false;
+   /* hk_g16_host_eval flushes fp32 denormals like the GPU, so host and GPU
+    * differ at most in NaN payloads, which no UNORM store can observe. */
+   for (unsigned rt = 0; rt < ARRAY_SIZE(ekey->rt_formats); ++rt) {
+      const enum pipe_format f = ekey->rt_formats[rt];
+      if (f != PIPE_FORMAT_NONE &&
+          (!util_format_is_unorm(f) || util_format_is_srgb(f)))
+         return false;
+   }
+   return true;
+}
+
+/* Root byte offset of the 32-bit push constant the main's root uniform DMA
+ * places at uniform half `half`. */
+static bool
+hk_g16_host_root_offset(const struct hk_shader *shader, unsigned half,
+                        uint32_t *offset_B)
+{
+   for (unsigned i = 0; i < shader->b.info.agx3_uniform_dma_count; ++i) {
+      const struct agx3_uniform_dma_span *s = &shader->b.info.agx3_uniform_dma[i];
+      if (s->source != AGX3_UNIFORM_DMA_POINTER ||
+          s->pointer != shader->info.agx3_root_uniform || half < s->dest ||
+          half + 2 > s->dest + s->halfs)
+         continue;
+      const uint32_t o = s->offset_B + (half - s->dest) * 2;
+      if ((o & 3) || o < hk_root_descriptor_offset(push) ||
+          o + 4 > hk_root_descriptor_offset(push) + HK_MAX_PUSH_SIZE)
+         return false;
+      *offset_B = o;
+      return true;
+   }
+   return false;
+}
+
+static bool
+hk_g16_host_classify(const struct hk_shader *shader, struct hash_table *temps,
+                     nir_scalar s, struct hk_g16_host_src *out)
+{
+   if (s.def->bit_size != 32)
+      return false;
+   struct hash_entry *he = _mesa_hash_table_search(temps, s.def);
+   if (he) {
+      if (s.comp != 0)
+         return false;
+      *out = (struct hk_g16_host_src){HK_G16_HOST_TEMP,
+                                      (uint32_t)(uintptr_t)he->data - 1};
+      return true;
+   }
+   if (nir_scalar_is_const(s)) {
+      *out = (struct hk_g16_host_src){HK_G16_HOST_IMM,
+                                      (uint32_t)nir_scalar_as_uint(s)};
+      return true;
+   }
+   nir_instr *parent = nir_def_instr(s.def);
+   if (parent->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(parent);
+   uint32_t offset_B;
+   if (intr->intrinsic == nir_intrinsic_load_preamble) {
+      if (!hk_g16_host_root_offset(shader,
+                                   nir_intrinsic_base(intr) + 2 * s.comp,
+                                   &offset_B))
+         return false;
+   } else if (intr->intrinsic == nir_intrinsic_load_global_constant) {
+      /* Push constants before the backend moves them to the root uniform
+       * DMA: a load through the root pointer at a constant offset. */
+      nir_scalar a = nir_scalar_chase_movs(nir_get_scalar(intr->src[0].ssa, 0));
+      uint64_t off = 0;
+      if (nir_scalar_is_alu(a) && nir_scalar_alu_op(a) == nir_op_iadd) {
+         nir_scalar x = nir_scalar_chase_alu_src(a, 0);
+         nir_scalar y = nir_scalar_chase_alu_src(a, 1);
+         if (nir_scalar_is_const(x)) {
+            nir_scalar t = x;
+            x = y;
+            y = t;
+         }
+         if (!nir_scalar_is_const(y))
+            return false;
+         off = nir_scalar_as_uint(y);
+         a = x;
+      }
+      nir_instr *base = nir_def_instr(a.def);
+      if (a.def->bit_size != 64 || base->type != nir_instr_type_intrinsic ||
+          nir_instr_as_intrinsic(base)->intrinsic !=
+             nir_intrinsic_load_preamble ||
+          nir_intrinsic_base(nir_instr_as_intrinsic(base)) !=
+             shader->info.agx3_root_uniform)
+         return false;
+      off += 4 * s.comp;
+      if ((off & 3) || off < hk_root_descriptor_offset(push) ||
+          off + 4 > hk_root_descriptor_offset(push) + HK_MAX_PUSH_SIZE)
+         return false;
+      offset_B = off;
+   } else {
+      return false;
+   }
+   *out = (struct hk_g16_host_src){HK_G16_HOST_ROOT, offset_B};
+   return true;
+}
+
+/* Take the uniform-only exact fp32 arithmetic of `nir` into `prog` and have
+ * the program load its results from uniform halves [0, 2 * prog->n_out).
+ * Returns false, leaving the program's instructions as they were, when there
+ * is nothing to take or the halves are not free. */
+static bool
+hk_g16_host_lower(nir_shader *nir, const struct hk_shader *shader,
+                  struct hk_g16_host_prog *prog)
+{
+   memset(prog, 0, sizeof(*prog));
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   const unsigned reserved = 2 * HK_G16_HOST_MAX_OUT;
+
+   if (shader->info.agx3_indexed_sampler_valid ||
+       shader->info.agx3_combined_sampler_valid ||
+       shader->info.agx3_gen1_fragment_rq ||
+       shader->b.info.push_count < reserved)
+      return false;
+   for (unsigned i = 0; i < shader->b.info.agx3_uniform_dma_count; ++i) {
+      if (shader->b.info.agx3_uniform_dma[i].dest < reserved)
+         return false;
+   }
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(instr)->intrinsic ==
+                nir_intrinsic_load_preamble &&
+             nir_intrinsic_base(nir_instr_as_intrinsic(instr)) < reserved)
+            return false;
+      }
+   }
+
+   nir_divergence_analysis(nir);
+   struct hash_table *temps = _mesa_pointer_hash_table_create(NULL);
+   if (!temps)
+      return false;
+   nir_def *defs[HK_G16_HOST_MAX_OPS];
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         int opcode;
+         switch (alu->op) {
+         case nir_op_fsat: opcode = HK_G16_HOST_FSAT; break;
+         case nir_op_fmul: opcode = HK_G16_HOST_FMUL; break;
+         case nir_op_fadd: opcode = HK_G16_HOST_FADD; break;
+         case nir_op_fneg: opcode = HK_G16_HOST_FNEG; break;
+         case nir_op_fabs: opcode = HK_G16_HOST_FABS; break;
+         case nir_op_mov: opcode = HK_G16_HOST_MOV; break;
+         default: continue;
+         }
+         if (alu->def.bit_size != 32 || alu->def.num_components != 1 ||
+             alu->def.divergent || prog->n_ops >= HK_G16_HOST_MAX_OPS)
+            continue;
+         struct hk_g16_host_op op = {.opcode = opcode};
+         bool ok = true;
+         for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs && ok; ++i)
+            ok = hk_g16_host_classify(
+               shader, temps,
+               nir_get_scalar(alu->src[i].src.ssa, alu->src[i].swizzle[0]),
+               &op.src[i]);
+         if (!ok)
+            continue;
+         defs[prog->n_ops] = &alu->def;
+         prog->ops[prog->n_ops] = op;
+         _mesa_hash_table_insert(temps, &alu->def,
+                                 (void *)(uintptr_t)(prog->n_ops + 1));
+         prog->n_ops++;
+      }
+   }
+
+   /* Results some program instruction still reads. */
+   for (unsigned i = 0; i < prog->n_ops; ++i) {
+      bool frontier = false;
+      nir_foreach_use_including_if(use, defs[i]) {
+         if (nir_src_is_if(use)) {
+            frontier = true;
+            continue;
+         }
+         nir_instr *user = nir_src_use_instr(use);
+         if (user->type != nir_instr_type_alu ||
+             !_mesa_hash_table_search(temps, &nir_instr_as_alu(user)->def))
+            frontier = true;
+      }
+      if (!frontier)
+         continue;
+      if (prog->n_out >= HK_G16_HOST_MAX_OUT) {
+         _mesa_hash_table_destroy(temps, NULL);
+         memset(prog, 0, sizeof(*prog));
+         return false;
+      }
+      prog->out[prog->n_out++] = i;
+   }
+   _mesa_hash_table_destroy(temps, NULL);
+   if (!prog->n_out) {
+      memset(prog, 0, sizeof(*prog));
+      return false;
+   }
+
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   for (unsigned k = 0; k < prog->n_out; ++k) {
+      nir_def *u = nir_load_preamble(&b, 1, 32, .base = 2 * k);
+      nir_def_rewrite_uses(defs[prog->out[k]], u);
+   }
+   nir_progress(true, impl, nir_metadata_none);
+   return true;
+}
+
+/* The GPU flushes fp32 denormals in arithmetic: hk exposes
+ * shaderDenormFlushToZeroFloat32 and no fp32 denormal preservation, so every
+ * fadd, fmul and fsat sees denormal operands as zero and returns zero for a
+ * denormal result. The host must do the same, or a tiny intermediate that the
+ * GPU flushes can be scaled back into range by a later multiply. Results are
+ * flushed after rounding to fp32; the zero keeps the sign. */
+static inline float
+hk_g16_host_ftz(float f)
+{
+   return fpclassify(f) == FP_SUBNORMAL ? copysignf(0.0f, f) : f;
+}
+
+static unsigned
+hk_g16_host_num_srcs(uint8_t opcode)
+{
+   return opcode == HK_G16_HOST_FMUL || opcode == HK_G16_HOST_FADD ? 2 : 1;
+}
+
+/* Bit-exact host counterpart of the taken GPU operations: each result is
+ * rounded to fp32 on its own (volatile: no contraction across operations),
+ * to nearest even like the GPU, whatever rounding mode the calling thread
+ * has set.
+ * fneg, fabs and mov only change or copy bits and flush nothing; whatever
+ * consumes their result on the GPU flushes it there. */
+static void
+hk_g16_host_eval(const struct hk_g16_host_prog *p, const uint8_t *root,
+                 uint32_t *out)
+{
+   volatile float t[HK_G16_HOST_MAX_OPS];
+   const int caller_round = fegetround();
+   if (caller_round != FE_TONEAREST)
+      fesetround(FE_TONEAREST);
+   for (unsigned i = 0; i < p->n_ops; ++i) {
+      float s[2] = {0.0f, 0.0f};
+      /* Unused sources are zero-filled TEMP 0: never read them. */
+      const unsigned n_src = hk_g16_host_num_srcs(p->ops[i].opcode);
+      for (unsigned j = 0; j < n_src; ++j) {
+         const struct hk_g16_host_src *src = &p->ops[i].src[j];
+         uint32_t u = 0;
+         if (src->kind == HK_G16_HOST_TEMP) {
+            s[j] = t[src->value];
+            continue;
+         }
+         if (src->kind == HK_G16_HOST_IMM)
+            u = src->value;
+         else
+            memcpy(&u, root + src->value, sizeof(u));
+         memcpy(&s[j], &u, sizeof(u));
+      }
+      float r;
+      switch (p->ops[i].opcode) {
+      case HK_G16_HOST_FSAT: {
+         const float x = hk_g16_host_ftz(s[0]);
+         r = isnan(x) ? 0.0f : x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x;
+         break;
+      }
+      case HK_G16_HOST_FMUL:
+         r = hk_g16_host_ftz(hk_g16_host_ftz(s[0]) * hk_g16_host_ftz(s[1]));
+         break;
+      case HK_G16_HOST_FADD:
+         r = hk_g16_host_ftz(hk_g16_host_ftz(s[0]) + hk_g16_host_ftz(s[1]));
+         break;
+      case HK_G16_HOST_FNEG: r = -s[0]; break;
+      case HK_G16_HOST_FABS: r = fabsf(s[0]); break;
+      default: r = s[0]; break;
+      }
+      t[i] = r;
+   }
+   if (caller_round != FE_TONEAREST)
+      fesetround(caller_round);
+   for (unsigned k = 0; k < p->n_out; ++k) {
+      const float f = t[p->out[k]];
+      memcpy(&out[k], &f, sizeof(f));
+   }
+}
+
 static struct agx_shader_part *
 hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
                            const struct agx_fs_epilog_key *ekey,
-                           const BITSET_WORD *partitions)
+                           const BITSET_WORD *partitions,
+                           struct hk_g16_host_prog *host)
 {
    /* A refusal of these inputs is final: remember it with the programs. */
 #define HK_MONO_REFUSE(why)                                                    \
@@ -7035,7 +7327,13 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
        MAX2(ekey->nr_samples, 1) != main_samples)
       HK_MONO_REFUSE("epilog shape");
 
-   disk = hk_g17p_mono_disk_key(dev, shader, ekey, partitions, disk_key);
+   /* Host-evaluated programs are not stored: their host half lives in the
+    * linked shader only. */
+   memset(host, 0, sizeof(*host));
+   const bool host_eval = !inline_samples &&
+                          hk_g16_host_eval_allowed(dev, ekey);
+   disk = !host_eval &&
+          hk_g17p_mono_disk_key(dev, shader, ekey, partitions, disk_key);
    if (disk) {
       size_t size = 0;
       uint8_t *data =
@@ -7184,6 +7482,9 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
       nir->info.fs.uses_sample_shading = false;
    }
 
+   if (host_eval && hk_g16_host_lower(nir, shader, host))
+      NIR_PASS(_, nir, nir_opt_dce);
+
    struct agx_shader_key key = shader->g17p_mono_key;
    if (inline_samples)
       key.fs.inside_sample_loop = false;
@@ -7328,8 +7629,9 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
         (agx_native_graphics(&dev->dev) &&
          (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND))) &&
        !prolog && key->nr_samples_shaded == 0 && shader->g17p_mono_nir) {
+      struct hk_g16_host_prog host;
       struct agx_shader_part *mono = hk_g17p_inline_epilog_part(
-         dev, shader, &key->epilog, g17p_tile_partitions);
+         dev, shader, &key->epilog, g17p_tile_partitions, &host);
       if (mono) {
          struct hk_fast_link_key *mono_key_clone =
             ralloc_memdup(shader->linked.ht, key, sizeof(*key));
@@ -7360,6 +7662,7 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
                key->epilog.blend_constant_base;
             mono_linked->g17p_emrt_heap_base = key->epilog.emrt_heap_base;
             mono_linked->g17p_prolog_uses_root = key->prolog.statistics;
+            mono_linked->g16_host = host;
             _mesa_hash_table_insert(shader->linked.ht, mono_key_clone,
                                     mono_linked);
             return mono_linked;
@@ -9982,6 +10285,8 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
    key->epilog.link.already_ran_zs |= nontrivial_force_early;
    key->epilog.native_imageblock = in->tib->native_imageblock;
    key->epilog.max_sample_size_B = in->tib->max_sample_size_B;
+   key->epilog.blend_dst_first =
+      dev->dev.chip == AGX_CHIP_G16G;
    key->epilog.resident_mask = in->tib->resident_mask;
    key->epilog.max_bytes_per_tile = in->tib->max_bytes_per_tile;
    key->epilog.max_samples_per_tile = in->tib->max_samples_per_tile;
@@ -10795,6 +11100,18 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       if (gfx->descriptors.root.draw.geometry_params != geometry_params) {
          gfx->descriptors.root.draw.geometry_params = geometry_params;
          gfx->descriptors.root_dirty = true;
+      }
+   }
+
+   /* G16G host-evaluated fragment uniforms follow the push constants and the
+    * linked program; both reach here before the root upload. */
+   if (linked_fs && linked_fs->g16_host.n_out) {
+      uint32_t v[HK_G16_HOST_MAX_OUT];
+      const size_t size = linked_fs->g16_host.n_out * sizeof(v[0]);
+      hk_g16_host_eval(&linked_fs->g16_host, (const uint8_t *)&desc->root, v);
+      if (memcmp(desc->root.g16_host_unif, v, size)) {
+         memcpy(desc->root.g16_host_unif, v, size);
+         desc->root_dirty = true;
       }
    }
 
