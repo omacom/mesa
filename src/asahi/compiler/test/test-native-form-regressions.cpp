@@ -5899,3 +5899,108 @@ TEST(NativeForms, M5OrSelectTracksVectorConversionComponent)
       }
    }
 }
+
+TEST(NativeForms, G16SharedNegativeZero)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G16G;
+   b->shader->key = &key;
+   agx_instr *adds[4];
+   for (unsigned c = 0; c < 4; ++c) {
+      adds[c] = agx_fadd_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                          agx_uniform(16 + 2*c, AGX_SIZE_32), agx_negzero());
+      adds[c]->saturate = true;
+   }
+   agx_lower_uniform_sources(b->shader);
+   for (unsigned c = 0; c < 4; ++c) {
+      EXPECT_TRUE(adds[c]->saturate);
+      EXPECT_EQ(adds[c]->op, AGX_OPCODE_FADD);
+      EXPECT_EQ(adds[c]->dest[0].size, AGX_SIZE_32);
+      EXPECT_EQ(adds[c]->src[0].type, AGX_INDEX_UNIFORM);
+      EXPECT_EQ(adds[c]->src[1].size, AGX_SIZE_32);
+      EXPECT_TRUE(agx_is_equiv(adds[c]->src[1], adds[0]->src[1]));
+   }
+   unsigned zeros = 0;
+   agx_foreach_instr_global(b->shader, I) {
+      if (I->op == AGX_OPCODE_MOV_IMM && I->imm == 0x80000000) zeros++;
+   }
+   EXPECT_EQ(zeros, 1u);
+   ralloc_free(mem);
+}
+
+TEST(NativeForms, G16CapturedBlend)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT,
+      &agx_nir_options, "G16 captured RGBA8 blend");
+   nir_def *mask = nir_imm_intN_t(&b, 255, 16);
+   nir_def *dst = nir_load_local_pixel_agx(&b, 4, 32, mask);
+   nir_intrinsic_instr *ld = nir_def_as_intrinsic(dst);
+   nir_intrinsic_set_format(ld, PIPE_FORMAT_R8_UNORM);
+   nir_def *src = agx_test_load_preamble(&b, 4, 32, 16);
+   nir_def *a = nir_fsat(&b, nir_channel(&b, src, 3));
+   nir_def *inv = nir_fsub(&b, nir_imm_float(&b, 1), a);
+   nir_def *v[4];
+   for (unsigned i=0; i<3; i++)
+      v[i] = nir_ffma(&b, nir_fsat(&b, nir_channel(&b, src, i)), a,
+                        nir_fmul(&b, nir_channel(&b, dst, i), inv));
+   v[3] = nir_ffma(&b, nir_channel(&b, dst, 3), inv, a);
+   agx_test_store_local_pixel_agx(&b, nir_vec4(&b,v[0],v[1],v[2],v[3]), mask,
+      nir_undef(&b,2,16),0,15,PIPE_FORMAT_R8_UNORM);
+   b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
+   b.shader->info.outputs_read = BITFIELD64_BIT(FRAG_RESULT_DATA0);
+   b.shader->info.fs.uses_fbfetch_output = true;
+   b.shader->info.io_lowered = true;
+   agx_shader_key key = {};
+   key.dev.encoding=AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip=AGX_CHIP_G16G;
+   key.no_preamble=true;
+   key.reserved_preamble=24;
+   key.fs.nr_samples=1;
+   agx_shader_part part={};
+   ASSERT_TRUE(agx_compile_shader_nir(b.shader,&key,&part));
+   EXPECT_EQ(part.info.stats.instrs, 22u);
+   EXPECT_EQ(part.info.binary_size, 170u);
+   fprintf(stderr,"G16 CAPTURED: instructions=%u bytes=%u gprs=%u spills=%u\n",
+      part.info.stats.instrs,part.info.binary_size,part.info.nr_gprs,part.info.stats.spills);
+   free(part.binary);
+   ralloc_free(b.shader);
+}
+
+TEST(NativeForms, G16NegativeZeroBoundaries)
+{
+   for (bool saturate : {false,true}) {
+      for (unsigned imm : {0u,0x80u,0x38u}) {
+         void *mem=ralloc_context(NULL);
+         agx_builder *b=agx_test_builder(mem);
+         agx_shader_key key={};
+         key.dev.chip=AGX_CHIP_G16G;
+         key.dev.encoding=AGX_ISA_ENCODING_AGX3B;
+         b->shader->key=&key;
+         agx_instr *I=agx_fadd_to(b,agx_temp(b->shader,AGX_SIZE_32),
+                                agx_uniform(16,AGX_SIZE_32),agx_immediate(imm));
+         I->saturate=saturate;
+         agx_lower_uniform_sources(b->shader);
+         bool eligible=saturate && imm==0x80;
+         EXPECT_EQ(I->src[0].type,eligible ? AGX_INDEX_UNIFORM : AGX_INDEX_NORMAL);
+         EXPECT_EQ(I->saturate,saturate);
+         EXPECT_EQ(I->op,AGX_OPCODE_FADD);
+         ralloc_free(mem);
+      }
+   }
+   /* Materialization preserves the negative-zero operand bit-for-bit.
+    * Include NaNs, both zero signs, subnormals, infinities and clamp edges.
+    * This host check does not claim GPU NaN/denormal qualification. */
+   for (uint32_t bits : {0u,0x80000000u,1u,0x80000001u,0x7fc12345u,
+                         0x7f800000u,0xff800000u,0x3f7fffffu,0x3f800001u}) {
+      float input; memcpy(&input,&bits,4);
+      uint32_t nz=0x80000000u; float reg;memcpy(&reg,&nz,4);
+      volatile float x=input;
+      volatile float a=x + -0.0f;
+      volatile float b=x + reg;
+      float aa=a,bb=b;uint32_t ab,bbits;memcpy(&ab,&aa,4);memcpy(&bbits,&bb,4);
+      EXPECT_EQ(ab,bbits);
+   }
+}

@@ -678,6 +678,43 @@ m5_native_isel_uniform(const agx_context *ctx, const agx_instr *I)
 void
 agx_lower_uniform_sources(agx_context *ctx)
 {
+   /* Preserve the exact f32 add and saturation. Only change which operand
+    * satisfies the existing mixed uniform/GPR encoding contract.
+    *
+    * The uniform source limits:
+    * - (value & 1): uniform indices count 16-bit halves, and an f32 uniform
+    *   operand must start on an even half. This is an encoding limit, the
+    *   one agx_instr_accepts_uniform() applies to FADD on AGX3B and
+    *   agx3_uniform_float_encode() applies to an AGX3_FLOAT_UNIFORM source.
+    * - (value >= 256): not an encoding limit. agx3_uniform_float_encode()
+    *   takes uniform sources up to half 511. The pass keeps the bound it was
+    *   measured with, the low half of the uniform file (the `high` split in
+    *   agx_instr_accepts_uniform()); a high-half uniform keeps the existing
+    *   copy.
+    */
+   if (ctx->key->dev.chip == AGX_CHIP_G16G && !ctx->is_preamble) {
+      agx_foreach_block(ctx, block) {
+         agx_index zero = agx_null();
+         agx_foreach_instr_in_block_safe(block, I) {
+            if (I->op != AGX_OPCODE_FADD || !I->saturate ||
+                I->nr_dests != 1 || I->nr_srcs != 2 ||
+                I->dest[0].size != AGX_SIZE_32 ||
+                I->src[0].type != AGX_INDEX_UNIFORM ||
+                I->src[0].size != AGX_SIZE_32 ||
+                I->src[0].value >= 256 || (I->src[0].value & 1) ||
+                I->src[0].abs || I->src[0].neg ||
+                !agx_is_equiv(I->src[1], agx_negzero()) ||
+                I->src[1].abs || I->src[1].neg)
+               continue;
+            if (agx_is_null(zero)) {
+               agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+               zero = agx_mov_imm(&b, 32, 0x80000000);
+            }
+            I->src[1] = zero;
+         }
+      }
+   }
+
    agx_foreach_instr_global_safe(ctx, I) {
       agx3_lower_m5_modified_fma_immediates(ctx, I);
 
