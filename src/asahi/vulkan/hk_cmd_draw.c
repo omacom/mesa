@@ -9982,6 +9982,8 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
    key->epilog.link.already_ran_zs |= nontrivial_force_early;
    key->epilog.native_imageblock = in->tib->native_imageblock;
    key->epilog.max_sample_size_B = in->tib->max_sample_size_B;
+   key->epilog.blend_dst_first =
+      dev->dev.chip == AGX_CHIP_G16G;
    key->epilog.resident_mask = in->tib->resident_mask;
    key->epilog.max_bytes_per_tile = in->tib->max_bytes_per_tile;
    key->epilog.max_samples_per_tile = in->tib->max_samples_per_tile;

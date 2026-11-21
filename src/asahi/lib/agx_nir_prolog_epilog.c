@@ -807,6 +807,7 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
 
             .alpha.src_factor = blend.alpha_src_factor,
             .alpha.dst_factor = blend.alpha_dst_factor,
+            .dst_term_first = key->blend_dst_first,
             .alpha.func = blend.alpha_func,
 
             .colormask = key->blend.rt[i].colormask,

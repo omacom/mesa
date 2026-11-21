@@ -1207,6 +1207,7 @@ void agx_lower_spill(agx_context *ctx);
 void agx3_split_vector_stack_access(agx_context *ctx);
 bool agx3_lower_texture_publications(agx_context *ctx);
 bool agx3_fuse_fma_texture_publications(agx_context *ctx);
+bool agx3_g16_hoist_pixel_independent(agx_context *ctx);
 bool agx3_lower_scalar_texture_publications(agx_context *ctx);
 bool agx3_lower_scalar_cube_coordinates(agx_context *ctx);
 bool agx3_split_texture_coordinates(agx_context *ctx);
