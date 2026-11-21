@@ -2387,8 +2387,29 @@ agx_nir_lower_custom_border(nir_shader *nir)
  * clamp-to-0 sample tex_0, after descriptor lowering: taken iff the sampler's
  * clamp-to-0 index c is not negative, i.e. `if (c >= 0)`, with tex_0 sampling
  * c without its integer-border bit (hk_nir_lower_descriptors()). */
+/* G16G: whether the border test reads clamp_0_sampler_index_or_negative and
+ * the clamp-to-0 sample reads the unbiased clamp-to-0 index of the same
+ * sampled-image descriptor, as hk_nir_lower_descriptors() emits them (two
+ * loads from one descriptor set address). */
 static bool
-hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p)
+hk_g16_border_test_and_index(nir_scalar tested, nir_scalar c)
+{
+   const uint64_t delta =
+      offsetof(struct hk_sampled_image_descriptor_sw,
+               clamp_0_sampler_index_or_negative) -
+      offsetof(struct hk_sampled_image_descriptor_sw,
+               g17p.unbiased_clamp_0_sampler_index);
+   nir_scalar tb, cb;
+   uint64_t to, co;
+   if (!hk_nir_border_address(tested, &tb, &to) ||
+       !hk_nir_border_address(c, &cb, &co) || to - co != delta)
+      return false;
+   return nir_scalar_equal(tb, cb);
+}
+
+static bool
+hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p,
+                          bool g16_twin)
 {
    const int s = nir_tex_instr_src_index(tex_0, nir_tex_src_sampler_handle);
    if (s < 0)
@@ -2416,6 +2437,10 @@ hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p)
       return false;
    if (nir_scalar_equal(tested, c))
       return true;
+   /* G16G: the branch and the clamp-to-0 sample read the same descriptor
+    * field (clamp_0_sampler_index_or_negative) through two loads. */
+   if (g16_twin)
+      return hk_g16_border_test_and_index(tested, c);
    if (!g17p)
       return false;
    const struct hk_sampled_image_descriptor_layout native =
@@ -2432,7 +2457,8 @@ hk_is_border_emulation_if(nir_if *nif, nir_tex_instr *tex_0, bool g17p)
  * emulation, unless every clamp-to-0 sample sits directly in the then-list
  * of its branch (hk_is_border_emulation_if()). */
 static bool
-hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs, bool g17p)
+hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs, bool g17p,
+                         bool g16_twin)
 {
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
@@ -2451,7 +2477,8 @@ hk_find_border_emulation(nir_shader *nir, struct util_dynarray *ifs, bool g17p)
             foreach_list_typed(nir_cf_node, node, node, &nif->then_list)
                in_then |= node == &block->cf_node;
             if (!in_then ||
-                !hk_is_border_emulation_if(nif, nir_instr_as_tex(instr), g17p)) {
+                !hk_is_border_emulation_if(nif, nir_instr_as_tex(instr), g17p,
+                                          g16_twin)) {
                return false;
             }
 
@@ -5753,7 +5780,16 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       struct hk_physical_device *pdev = hk_device_physical(dev);
       struct util_dynarray ifs;
       util_dynarray_init(&ifs, NULL);
-      if (hk_find_border_emulation(nir, &ifs, dev->dev.chip == AGX_CHIP_G17P) &&
+      /* G16G: a twin is chosen when the shader is compiled and replaced when
+       * a command buffer binds it or draws after a border sampler exists.
+       * Update-after-bind sampled images could put such a sampler under an
+       * already recorded border-free draw, so those devices keep the
+       * emulation (the feature is part of the shader key). */
+      const bool g16_twin =
+         dev->dev.chip == AGX_CHIP_G16G &&
+         !(features & HK_FEAT_SAMPLED_IMAGE_UPDATE_AFTER_BIND);
+      if (hk_find_border_emulation(nir, &ifs, dev->dev.chip == AGX_CHIP_G17P,
+                                   g16_twin) &&
           ifs.size) {
          if (twin_of || p_atomic_read(&pdev->border_emulation)) {
             border_emulating = true;

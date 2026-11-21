@@ -53,6 +53,12 @@ typedef struct {
    bool src_premultiplied;
    bool dst_premultiplied;
    enum pipe_blend_overlap_mode overlap;
+
+   /* Emit the destination term first in additive blending, so contraction
+    * fuses dst * dst_factor into the final multiply-add and the source
+    * product stays a separate multiply that does not depend on the
+    * destination. */
+   bool dst_term_first;
 } nir_lower_blend_rt;
 
 typedef struct {

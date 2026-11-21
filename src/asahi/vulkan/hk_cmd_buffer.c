@@ -2538,7 +2538,20 @@ hk_g17p_graphics_uniform_ranges(
             .size_halfs = 4, .address = pointer,
          };
       }
-      if (hk_cmd_uses_blend_constant(cmd)) {
+      if (linked && linked->g16_host.n_out) {
+         /* A G16G inline-blend program with host-evaluated uniforms reads
+          * them in halves [0, 2 * n_out), which only the spill table and the
+          * blend constants otherwise use: it is built for neither (an inline
+          * program refuses epilogs reading blend constants). */
+         if (native_spills || !root_ptr)
+            return hk_g17p_graphics_ranges_refused(range_count, count);
+         sources[count] = HK_G17P_RANGE_SOURCE_ROOT;
+         ranges[count++] = (struct agx3_ioto_uniform_range){
+            .start_halfs = 0,
+            .size_halfs = 2 * linked->g16_host.n_out,
+            .address = root_ptr + hk_root_descriptor_offset(g16_host_unif),
+         };
+      } else if (hk_cmd_uses_blend_constant(cmd)) {
          /* The non-monolithic blend epilog reads the four constants from
           * the base selected by its linked key. It is half4 for the standard
           * ABI and moves beyond the main shader footprint when HAL200 native

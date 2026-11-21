@@ -557,6 +557,47 @@ hk_rast_mesh_variant(struct hk_api_shader *obj)
     AGX_USC_REGISTERS_LENGTH + AGX_USC_SHADER_LENGTH + AGX_USC_SHARED_LENGTH + \
     AGX_USC_SAMPLER_LENGTH + (AGX_USC_UNIFORM_LENGTH * 9))
 
+/* G16G: uniform-only fp32 arithmetic of an
+ * inline-blend fragment program, evaluated on the host for each draw and
+ * delivered in uniform halves [0, 2 * n_out) from the root's g16_host_unif.
+ * G16G forms no native constant program (agx_chip_native_preamble()), so
+ * without this every pixel recomputes these values. Only exact IEEE fp32
+ * operations are taken: fused multiply-add stays on the GPU
+ * (agx_chip_exact_fma32()). */
+#define HK_G16_HOST_MAX_OPS 24
+#define HK_G16_HOST_MAX_OUT 6
+
+enum hk_g16_host_src_kind {
+   HK_G16_HOST_TEMP,
+   HK_G16_HOST_IMM,
+   HK_G16_HOST_ROOT,
+};
+
+enum hk_g16_host_opcode {
+   HK_G16_HOST_FSAT,
+   HK_G16_HOST_FMUL,
+   HK_G16_HOST_FADD,
+   HK_G16_HOST_FNEG,
+   HK_G16_HOST_FABS,
+   HK_G16_HOST_MOV,
+};
+
+struct hk_g16_host_src {
+   uint8_t kind;   /* enum hk_g16_host_src_kind */
+   uint32_t value; /* temp index, immediate bits or root byte offset */
+};
+
+struct hk_g16_host_op {
+   uint8_t opcode; /* enum hk_g16_host_opcode */
+   struct hk_g16_host_src src[2];
+};
+
+struct hk_g16_host_prog {
+   uint8_t n_ops, n_out;
+   uint8_t out[HK_G16_HOST_MAX_OUT];
+   struct hk_g16_host_op ops[HK_G16_HOST_MAX_OPS];
+};
+
 struct hk_linked_shader {
    struct agx_linked_shader b;
 
@@ -592,6 +633,9 @@ struct hk_linked_shader {
    /* The pipeline-statistics fragment prolog loads its counter address from
     * the descriptor root even when the application fragment shader does not. */
    bool g17p_prolog_uses_root;
+
+   /* See struct hk_g16_host_prog; n_out == 0 when unused. */
+   struct hk_g16_host_prog g16_host;
 
    /* An inline-blend fragment program that forms its own constant program
     * (hk_g17p_inline_epilog_part()) has its own uniform layout: this shader

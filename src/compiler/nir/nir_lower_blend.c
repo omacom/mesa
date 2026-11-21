@@ -51,11 +51,11 @@ static nir_def *
 nir_blend_func(
    nir_builder *b,
    enum pipe_blend_func func,
-   nir_def *src, nir_def *dst)
+   nir_def *src, nir_def *dst, bool dst_first)
 {
    switch (func) {
    case PIPE_BLEND_ADD:
-      return nir_fadd(b, src, dst);
+      return dst_first ? nir_fadd(b, dst, src) : nir_fadd(b, src, dst);
    case PIPE_BLEND_SUBTRACT:
       return nir_fsub(b, src, dst);
    case PIPE_BLEND_REVERSE_SUBTRACT:
@@ -1006,7 +1006,8 @@ nir_color_blend(nir_builder *b, nir_def *src, nir_def *src1, nir_def *dst,
             chan.dst_factor, rt->format);
       }
 
-      channels[c] = nir_blend_func(b, chan.func, psrc, pdst);
+      channels[c] = nir_blend_func(b, chan.func, psrc, pdst,
+                                   rt->dst_term_first);
    }
 
    return nir_vec(b, channels, 4);

@@ -370,6 +370,9 @@ struct agx_fs_epilog_key {
     * the constants after the main shader's uniform footprint instead. */
    uint16_t blend_constant_base;
 
+   /* Emit the blend destination term first (nir_lower_blend_rt::dst_term_first). */
+   bool blend_dst_first;
+
    /* Render targets whose tile value must be stored back unchanged (colour
     * write disabled while raster coverage still makes the tile nonempty).
     * Independent of blending, so it also holds for pure-integer formats. */
