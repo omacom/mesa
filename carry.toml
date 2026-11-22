@@ -17,5 +17,5 @@ why = "admit the measured 30-core T6034 G15C contract (M3 Max GPU)"
 
 [[carry]]
 pr = "aurora-silicon/mesa#416"
-commit = "18fbbdb23418276705026b8901da93e6eed60dbd"
+commit = "1be0ab79286d40aa82ddd49538107b4ef654ad5f"
 why = "Honeykrisp: restore the native G15S Vulkan capability profile"
