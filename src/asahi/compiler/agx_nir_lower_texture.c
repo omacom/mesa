@@ -30,6 +30,7 @@ struct agx_texture_lower_options {
    /* AGX_NIR_TEXTURE_IMAGE_SIDEBAND: Gen10 image atomics read their
     * addressing word after the texture/PBE pair, not from the PBE. */
    bool image_sideband;
+   bool level_zero_extent;
    agx_buffer_texture_metadata_cb buffer_metadata_cb;
    /* Formatless image loads still need view-bounds robustness. */
    bool robust_formatless_images;
@@ -279,6 +280,14 @@ lower_tex_crawl(nir_builder *b, nir_instr *instr, void *data)
        * descriptor's last word (agx_pack_texture), where Gen10 leaves it
        * free; Gen10 has no G17P metadata record. */
       res = load_buffer_metadata(b, ptr, AGX_GEN10_BUFFER_TEXTURE_SIZE_OFFSET, 32);
+   } else if (options && options->level_zero_extent && tex->op == nir_texop_txs &&
+              tex->sampler_dim == GLSL_SAMPLER_DIM_2D && !tex->is_array &&
+              nr_comps == 2 && nir_scalar_is_zero(nir_get_scalar(lod, 0))) {
+      /* The packed word is zero for a null image. A Vulkan 2D view always
+       * has two nonzero dimensions, each at most 32768. */
+      nir_def *extent = load_buffer_metadata(b, ptr, AGX_GEN10_IMAGE_EXTENT_OFFSET, 32);
+      res = nir_vec2(b, nir_iand_imm(b, extent, 0xffff),
+                     nir_ushr_imm(b, extent, 16));
    } else if (gen9 && tex->op == nir_texop_txs &&
        tex->sampler_dim != GLSL_SAMPLER_DIM_BUF) {
       res = libagx_txs_gen9(b, ptr, lod, nir_imm_int(b, nr_comps),
@@ -1407,19 +1416,18 @@ image_texel_address(nir_builder *b, nir_intrinsic_instr *intr,
 
    nir_def *coord = intr->src[1].ssa;
 
-   /* For atomics, we always infer the format. We only go down this path with
-    * formatless intrinsics when lowering multisampled image stores, but that
-    * uses the return_index path that ignores the block size.
+   /* For atomics, we always infer the format. Formatless multisampled image
+    * stores use the return_index path, which only ignores the block size on
+    * non-layered images (layered images divide layer_stride_sw by it).
     */
    enum pipe_format format = nir_intrinsic_format(intr);
-   assert(return_index || format != PIPE_FORMAT_NONE);
-
-   nir_def *blocksize_B = nir_imm_int(b, util_format_get_blocksize(format));
-
    enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
    bool layered = nir_intrinsic_image_array(intr) ||
                   (dim == GLSL_SAMPLER_DIM_CUBE) ||
                   (dim == GLSL_SAMPLER_DIM_3D);
+   assert((return_index && !layered) || format != PIPE_FORMAT_NONE);
+
+   nir_def *blocksize_B = nir_imm_int(b, util_format_get_blocksize(format));
 
    if (dim == GLSL_SAMPLER_DIM_BUF && return_index) {
       return nir_channel(b, coord, 0);
@@ -2097,7 +2105,8 @@ lower_texture(nir_shader *s, unsigned generation, bool buffer_metadata,
    bool progress = false;
    const bool g18g = generation & AGX_NIR_TEXTURE_GENERATION_G18G;
    const bool image_sideband = generation & AGX_NIR_TEXTURE_IMAGE_SIDEBAND;
-   generation &= ~(AGX_NIR_TEXTURE_GENERATION_G18G |
+   const bool level_zero_extent = generation & AGX_NIR_TEXTURE_LEVEL_ZERO_EXTENT;
+   generation &= ~(AGX_NIR_TEXTURE_LEVEL_ZERO_EXTENT | AGX_NIR_TEXTURE_GENERATION_G18G |
                    AGX_NIR_TEXTURE_IMAGE_SIDEBAND);
    const bool gen9 = generation == 9;
    const struct agx_texture_lower_options options = {
@@ -2106,6 +2115,7 @@ lower_texture(nir_shader *s, unsigned generation, bool buffer_metadata,
       .g18g = g18g && generation == 10,
       .buffer_metadata = buffer_metadata,
       .image_sideband = image_sideband,
+      .level_zero_extent = level_zero_extent,
       .buffer_metadata_cb = buffer_metadata_cb,
       .robust_formatless_images = robust_formatless_images,
       .robust_texel_fetch = robust_texel_fetch,

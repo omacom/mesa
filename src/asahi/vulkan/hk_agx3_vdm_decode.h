@@ -28,9 +28,10 @@ extern "C" {
  * blended fragment shaders, to 38 when agx_shader_info gains
  * needs_full_quads, to 39 when G17P payloads record the fragment
  * twins of unlinked mesh shaders, to 42 when unlinked G17P vertex
- * shaders over the canonical size carry relocatable varying writes, and to 43
- * when agx_shader_info gains launch_size. */
-#define HK_AGX3_SHADER_BINARY_VERSION 43u
+ * shaders over the canonical size carry relocatable varying writes, to 43
+ * when agx_shader_info gains launch_size, and to 44 when unlinked G17P vertex
+ * shaders drop the canonical layout for the relocatable one. */
+#define HK_AGX3_SHADER_BINARY_VERSION 44u
 #define HK_CLASSIC_SHADER_BINARY_VERSION 34u
 /* AGX2 image-acquire binaries now include memory-to-texture visibility. */
 #define HK_AGX2_SHADER_BINARY_VERSION 36u
@@ -38,21 +39,11 @@ extern "C" {
 static inline uint32_t
 hk_shader_binary_version(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G13G:
-   case AGX_CHIP_G13X:
-   case AGX_CHIP_G14G:
-   case AGX_CHIP_G14X:
-   case AGX_CHIP_G15P:
+   if (agx_chip_isa(chip) == AGX_ISA_AGX2)
       return HK_AGX2_SHADER_BINARY_VERSION;
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
+   if (agx_chip_g17p_or_m5(chip))
       return HK_AGX3_SHADER_BINARY_VERSION;
-   default:
-      return HK_CLASSIC_SHADER_BINARY_VERSION;
-   }
+   return HK_CLASSIC_SHADER_BINARY_VERSION;
 }
 
 /* API outputs include position. Unlinked shaders additionally reserve a

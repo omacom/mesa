@@ -657,7 +657,8 @@ agx_vdm_draw_size(enum agx_chip chip, struct agx_draw draw)
 }
 
 static inline GLOBAL uint32_t *
-agx_vdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
+agx_vdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip,
+                bool kernel_admits_inval)
 {
    /* The AGX3 encoding uses this exact type-1 memory-barrier word on every
     * byte-witnessed G15--G17 identity.  Do not feed those chips through the
@@ -665,24 +666,14 @@ agx_vdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
     * opcode/field layout.  Keep the unwitnessed G16P/G17A identities closed
     * instead of guessing from their neighbouring families.  G18G memory
     * barriers use the same word. */
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-   case AGX_CHIP_G18G:
+   if (agx_chip_has_record(chip, AGX_RECORD_VDM_BARRIER)) {
       /* With the USC cache invalidate where the kernel admits it
        * (agx_vdm_barrier_core.h). */
-      *out++ = agx_vdm_barrier_core_word(chip);
+      *out++ = agx_vdm_barrier_core_word(chip, kernel_admits_inval);
       return out;
+   }
 
+   switch (chip) {
    case AGX_CHIP_G16P:
    case AGX_CHIP_G17A:
    case AGX_CHIP_UNKNOWN:

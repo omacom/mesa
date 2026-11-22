@@ -441,12 +441,17 @@ agx_twiddled_allowed(const struct agx_resource *pres)
    return true;
 }
 
-/* G17P depth: a private, single-level, single-layer, single-sample Z32F
- * depth buffer, as Honeykrisp compresses (hk_g17p_compression_depth_format()).
- * ZLS writes it compressed through the metadata agx_batch already passes, and
- * the compressed Gen9 2D texture packet reads it. On the M4 Max this is
- * byte-identical to plain depth through depth testing across passes,
- * readback, sampling, shadow comparison, blits and scissored clears. */
+/* G17P depth: a private, single-level, single-layer 1x/2x/4x Z32_FLOAT or
+ * Z16_UNORM depth buffer (including the separated Z32_FLOAT plane of
+ * Z32F_S8 and Z24S8). ZLS writes it compressed through the metadata
+ * agx_batch already passes, and the compressed Gen9 2D / 2D-multisample
+ * texture packet reads it.
+ *
+ * The width0/height0 >= 16 check is intentionally in pixels (stricter than
+ * ail_can_compress(), which measures in samples at 2x/4x) so sub-16px
+ * multisample targets stay uncompressed where metadata overhead outweighs
+ * bandwidth savings.
+ */
 static bool
 agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
                                            const struct pipe_resource *templ)
@@ -454,18 +459,24 @@ agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
    return dev->chip == AGX_CHIP_G17P &&
           templ->target == PIPE_TEXTURE_2D && templ->depth0 == 1 &&
           templ->array_size <= 1 && templ->last_level == 0 &&
-          templ->nr_samples <= 1 && templ->format == PIPE_FORMAT_Z32_FLOAT &&
+          (templ->nr_samples <= 1 || templ->nr_samples == 2 ||
+           templ->nr_samples == 4) &&
+          (templ->format == PIPE_FORMAT_Z32_FLOAT ||
+           templ->format == PIPE_FORMAT_Z16_UNORM) &&
+          templ->width0 >= 16 && templ->height0 >= 16 &&
           !(templ->bind & ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_DEPTH_STENCIL));
 }
 
-/* G17P compresses a private, single-level, single-layer, single-sample 2D
- * colour image of agx_g17p_compression_color_format(): written by the
- * compressed Gen9 2D PBE (end-of-tile stores, blits, staging uploads) and
- * read by the compressed texture descriptor, the packets Honeykrisp
- * compresses its own G17P colour images with. Nothing decompresses such an
- * image in place: its format never spills from the tilebuffer, and it is
- * neither shared nor scanned out, so a feedback loop or a shader-image
- * binding reallocates it uncompressed (agx_decompress()), as on AGX2.
+/* G17P compresses a private, single-level, single-layer 1x/2x/4x 2D colour
+ * image of agx_g17p_compression_color_format(): written by the compressed
+ * Gen9 2D or 2x/4x multisample PBE (end-of-tile stores, blits, staging
+ * uploads) and read by the compressed texture descriptor. Nothing
+ * decompresses such an image in place: it is neither shared nor scanned out,
+ * so a spilling MRT framebuffer, feedback loop, or shader-image binding
+ * reallocates it uncompressed via agx_decompress().
+ *
+ * As with depth above, width0/height0 >= 16 is intentionally kept in pixels
+ * rather than samples to leave tiny sub-16px 2x/4x targets uncompressed.
  */
 static bool
 agx_g17p_private_compression_allowed(const struct agx_device *dev,
@@ -473,7 +484,10 @@ agx_g17p_private_compression_allowed(const struct agx_device *dev,
 {
    return dev->chip == AGX_CHIP_G17P && templ->target == PIPE_TEXTURE_2D &&
           templ->depth0 == 1 && templ->array_size <= 1 &&
-          templ->last_level == 0 && templ->nr_samples <= 1 &&
+          templ->last_level == 0 &&
+          (templ->nr_samples <= 1 || templ->nr_samples == 2 ||
+           templ->nr_samples == 4) &&
+          templ->width0 >= 16 && templ->height0 >= 16 &&
           !(templ->bind &
             ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET)) &&
           agx_g17p_compression_color_format(templ->format);
@@ -484,7 +498,7 @@ agx_compression_allowed(const struct agx_resource *pres)
 {
    const struct agx_device *dev = agx_device(pres->base.screen);
    const enum agx_descriptor_generation generation =
-      agx_gallium_descriptor_generation(dev->chip);
+      agx_chip_descriptor_generation(dev->chip);
 
    /* Allow disabling compression for debugging */
    if (dev->debug & AGX_DBG_NOCOMPRESS) {
@@ -1172,7 +1186,7 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
    agx_prepare_for_map(ctx, rsrc, level, usage, box, staging_blit);
 
    struct agx_device *dev = agx_device(pctx->screen);
-   const bool trace_read = (dev->chip == AGX_CHIP_G18G || agx_chip_g17_m5(dev->chip)) &&
+   const bool trace_read = agx_chip_hal300_path(dev->chip) &&
                           (dev->debug & AGX_DBG_FAULTTRACE) &&
                           (usage & PIPE_MAP_READ);
    if (trace_read) {
@@ -1416,7 +1430,7 @@ agx_clear(struct pipe_context *pctx, unsigned buffers,
 
    unsigned fastclear = buffers & ~(batch->draw | batch->load);
    struct agx_device *dev = agx_device(pctx->screen);
-   if (agx_native_graphics(dev)) {
+   if (agx_chip_native_agx3(dev->chip)) {
       agx_batch_init_state(batch);
       const struct agx_tilebuffer_layout *tib = &batch->tilebuffer_layout;
       /* A spilling multisample tilebuffer clears every target with the
@@ -1736,7 +1750,7 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
     * zero is only a real clear value when depth or stencil storage exists.
     * Honeykrisp submits M5 renders on the G17 runtime the same way
     * (hk_drm_g17p_depth_clear). */
-   if ((agx_native_graphics(dev) || dev->chip == AGX_CHIP_G18G ||
+   if ((agx_chip_native_or_g18g(dev->chip) ||
         agx_m5_render_resources(dev)) && !zres &&
        !sres)
       c->isp_bgobjdepth = fui(1.0f);
@@ -1827,7 +1841,7 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
    /* A direct resolve also writes a different image: loaded samples in
     * tiles without geometry must reach that destination. */
    if ((batch->clear & batch->resolve) ||
-       (agx_native_graphics(dev) && batch->key.resolve &&
+       (agx_chip_native_agx3(dev->chip) && batch->key.resolve &&
         (batch->load & PIPE_CLEAR_COLOR0)))
       c->flags |= DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES;
 
@@ -1952,7 +1966,7 @@ agx_flush_compute(struct agx_context *ctx, struct agx_batch *batch,
 {
    /* Finalize the encoder */
    struct agx_device *dev = agx_device(ctx->base.screen);
-   if (agx_native_graphics(dev)) {
+   if (agx_chip_native_agx3(dev->chip)) {
       uint8_t terminate[AGX3_CDM_STREAM_TERMINATE_SIZE];
       if (!agx3_cdm_stream_terminate_pack(dev->chip, terminate))
          UNREACHABLE("G17P CDM terminate must be grounded");
@@ -2292,14 +2306,16 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    else if (flags & (PIPE_CONTEXT_HIGH_PRIORITY | PIPE_CONTEXT_REALTIME_PRIORITY))
       priority = DRM_ASAHI_PRIORITY_HIGH;
 
-   ctx->queue_id = agx_create_command_queue(agx_device(screen), priority);
+   ctx->queue_id = agx_create_async_command_queue(agx_device(screen), priority,
+                                                  &ctx->async_submit);
 
    /* HIGH requires backend support and CAP_SYS_NICE or DRM master;
     * otherwise fall back to MEDIUM.
     */
    if (ctx->queue_id == UINT32_MAX && priority == DRM_ASAHI_PRIORITY_HIGH) {
       priority = DRM_ASAHI_PRIORITY_MEDIUM;
-      ctx->queue_id = agx_create_command_queue(agx_device(screen), priority);
+      ctx->queue_id = agx_create_async_command_queue(
+         agx_device(screen), priority, &ctx->async_submit);
    }
    if (ctx->queue_id == UINT32_MAX) {
       u_upload_destroy(pctx->stream_uploader);
@@ -2486,7 +2502,7 @@ agx_init_shader_caps(struct pipe_screen *pscreen)
        * texel-fetch entry, so native graphics and compute can expose
        * Gallium's complete API table without the legacy heap. Geometry
        * shaders use the same table through their lowered compute programs. */
-      if (agx_native_graphics(agx_device(pscreen)) &&
+      if (agx_chip_native_agx3(agx_device(pscreen)->chip) &&
           (i == MESA_SHADER_VERTEX || i == MESA_SHADER_FRAGMENT ||
            i == MESA_SHADER_GEOMETRY || i == MESA_SHADER_COMPUTE))
          caps->max_texture_samplers = PIPE_MAX_SAMPLERS;
@@ -2918,7 +2934,7 @@ agx_dmabuf_modifier_external_only(struct pipe_screen *screen, uint64_t modifier)
     */
    return modifier == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED &&
           !agx_gallium_shared_compression_supported(
-             agx_gallium_descriptor_generation(agx_device(screen)->chip));
+             agx_chip_descriptor_generation(agx_device(screen)->chip));
 }
 
 static void

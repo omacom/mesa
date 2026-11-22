@@ -20,6 +20,15 @@ hk_cmd_buffer_emit_cs_jump(struct hk_cmd_buffer *cmd, void *current,
    return (uint8_t *)current + AGX_CDM_STREAM_LINK_LENGTH;
 }
 
+/* The streams here record no alias sites (hk_cs::alias_sites stays zero), so
+ * the merge never moves any. */
+void
+hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd, const void *from,
+                               const void *from_end, uint8_t *to, size_t skip)
+{
+   assert(!"no alias sites are recorded");
+}
+
 /* Merged streams here record no attachments; with more than one merge call
  * the compiler keeps hk_cs_merge_cdm() out of line, with its attachment loop. */
 bool
@@ -216,7 +225,7 @@ int main(void)
    for (enum agx_chip chip = AGX_CHIP_G13G; chip < AGX_CHIP_UNKNOWN; ++chip)
       assert(hk_shader_binary_version(chip) ==
              (chip == AGX_CHIP_G17P || chip == AGX_CHIP_G17G ||
-              chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C ? 43 :
+              chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C ? 44 :
               chip <= AGX_CHIP_G15P ? 36 : 34));
    assert(hk_as_build_flags(AGX_CHIP_G17P, 0, true) == 0);
    assert(hk_as_build_flags(AGX_CHIP_G17P, DRM_ASAHI_FEATURE_RENDER_RAY_QUERY, true) == 0);

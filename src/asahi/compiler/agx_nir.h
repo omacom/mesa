@@ -73,7 +73,8 @@ bool agx_nir_lower_layer(struct nir_shader *s);
 bool agx_nir_lower_clip_distance(struct nir_shader *s);
 bool agx_nir_lower_subgroups(struct nir_shader *s);
 bool agx_nir_lower_subgroups_g17p(struct nir_shader *s);
-bool agx_nir_lower_subgroups_m5(struct nir_shader *s, bool native_shuffle_xor);
+bool agx_nir_lower_subgroups_m5(struct nir_shader *s, bool native_shuffle_xor,
+                                bool native_float_minmax);
 bool agx_nir_flush_subgroup_minmax(struct nir_shader *s);
 bool agx_nir_lower_dynamic_shuffle_xor(struct nir_shader *s);
 bool agx_nir_lower_quad_derivative_ids(struct nir_shader *s);
@@ -121,6 +122,10 @@ bool agx_nir_lower_texture(struct nir_shader *s);
  * read the word from the PBE's last eight bytes, where Gallium keeps it.
  * Texel-buffer atomics are not affected. */
 #define AGX_NIR_TEXTURE_IMAGE_SIDEBAND (1u << 9)
+/* Answer a constant level-zero size query of a non-array 2D view from the
+ * extent the driver keeps in the descriptor's last word
+ * (AGX_GEN10_IMAGE_EXTENT_OFFSET, agx_chip_texture_descriptor_spare_word). */
+#define AGX_NIR_TEXTURE_LEVEL_ZERO_EXTENT (1u << 11)
 bool agx_nir_lower_texture_for_generation(struct nir_shader *s, unsigned generation);
 /* robust_formatless_images: formatless image loads have not been lowered for
  * view-bounds robustness and require it. */

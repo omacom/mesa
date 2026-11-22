@@ -51,6 +51,11 @@ struct hk_queue {
        * occlusion query reads (hk_oq_submission_done()). Every value at or
        * below it is complete. */
       uint64_t signalled_value;
+
+      /* Latest timeline point that received the waits of a submission
+       * without control streams (queue_submit_empty()), 0 once it is known
+       * complete. Later kernel submissions of this queue wait for it. */
+      uint64_t empty_wait_point;
    } drm;
 
    /* M5 submissions whose command memory is still pinned, oldest first
@@ -130,6 +135,12 @@ VkResult hk_queue_init_kick(struct hk_device *dev,
 void hk_queue_finish(struct hk_device *dev, struct hk_queue *queue);
 
 void hk_device_quiesce_lost_submissions(struct hk_device *dev);
+
+/* The first command buffer of the submission whose recording failed, or NULL.
+ * Such a command buffer is not executable (vkEndCommandBuffer returned its
+ * error) and its streams may be incomplete. */
+struct vk_command_buffer *
+hk_submit_first_errored_cmd_buffer(const struct vk_queue_submit *submit);
 
 VkResult hk_queue_submit_bind_sparse_memory(struct hk_device *device,
                                             struct vk_queue_submit *submission);

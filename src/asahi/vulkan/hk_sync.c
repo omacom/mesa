@@ -555,7 +555,7 @@ hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
    const uint8_t render_kinds = HK_SYNC_GFX | HK_SYNC_XFER;
    const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
    if ((src_kinds & render_kinds) && (dst_kinds & HK_SYNC_GFX) &&
-       (agx_chip_g17_m5(chip) || chip == AGX_CHIP_G17P)) {
+       agx_chip_g17p_or_m5(chip)) {
       struct hk_sync_dep vtx = dep[HK_SYNC_VDM];
       vtx.cut = memory_cut(vtx.cut);
       if (vtx.prior & render_kinds)
@@ -777,9 +777,13 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       /* The pre-graphics work of a pipeline without software
        * pre-rasterization stages (draw parameter patching, index rewriting,
        * statistics) reads buffers in the draw-indirect and vertex-input
-       * stages alone: image barriers (HK_SYNC_GFX_IMG) do not order it. */
+       * stages alone: image barriers (HK_SYNC_GFX_IMG) do not order it.
+       * A spilling render pass's pre-graphics decompression accesses the
+       * spilled colour attachments themselves, so it must still honour
+       * image barriers. */
       uint8_t classes = full_kinds(cs->sync.kind);
-      if (!cmd->state.gfx.shaders[MESA_SHADER_TESS_CTRL] &&
+      if (!agx_tilebuffer_spills(&cmd->state.gfx.render.tilebuffer) &&
+          !cmd->state.gfx.shaders[MESA_SHADER_TESS_CTRL] &&
           !cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL] &&
           !cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY] &&
           !cmd->state.gfx.shaders[MESA_SHADER_TASK] &&
@@ -987,8 +991,7 @@ hk_sync_check_cs(struct hk_cmd_buffer *cmd)
       cs->sync.kind |= HK_SYNC_GFX_MEM;
    note_last(cmd, cs);
 
-   if ((agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
-        agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)) &&
+   if (agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
        cmd->sync.pending_start_ts.handle && !cs->timestamp.start.handle &&
        !cs->timestamp.end.handle) {
       cs->timestamp.start = cmd->sync.pending_start_ts;
@@ -1033,7 +1036,7 @@ static void
 stamp_carrier_launch(struct hk_cmd_buffer *cmd)
 {
    struct hk_cs *cs = cmd->current_cs.cs;
-   if (!agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) || !cs ||
+   if (!agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip) || !cs ||
        (!cs->timestamp.start.handle && !cs->timestamp.end.handle) ||
        cs->stats.cmds || cs->stats.flushes || cs->imm_writes.size)
       return;
@@ -1052,8 +1055,7 @@ hk_sync_end_cs_if_timestamped(struct hk_cmd_buffer *cmd)
       return;
 
    const bool g17p_start =
-      (agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
-       agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)) &&
+      agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
       cs->timestamp.start.handle;
    if (cs->timestamp.end.handle || g17p_start) {
       stamp_carrier_launch(cmd);
@@ -1231,7 +1233,8 @@ stamp_wait(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 {
    if (cs->type == HK_CS_CDM) {
       const struct hk_device *dev = hk_cmd_buffer_device(cmd);
-      if (agx_native_graphics(&dev->dev) && dev->dev.chip == AGX_CHIP_G17P &&
+      if (agx_chip_native_agx3(dev->dev.chip) &&
+          dev->dev.chip == AGX_CHIP_G17P &&
           (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)) {
          /* The logical compute queue already orders these GPU commands by
           * their mandatory kick parents. Adding the timestamp's same-CDM
@@ -1272,7 +1275,7 @@ static bool
 start_stamps_ordered(const struct hk_cmd_buffer *cmd)
 {
    const struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   return !((agx_native_graphics(&dev->dev) &&
+   return !((agx_chip_native_agx3(dev->dev.chip) &&
              dev->dev.chip == AGX_CHIP_G17P) ||
             agx_chip_g17_m5(dev->dev.chip));
 }
@@ -1364,6 +1367,11 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       if (gfx->timestamp.end.handle) {
          libagx_copy_timestamp(cmd, agx_1d(1), AGX_BARRIER_ALL | AGX_POSTGFX,
                                req.addr, gfx->timestamp.end.addr);
+         hk_cmd_note_query_range(cmd, cmd->current_cs.post_gfx,
+                                 gfx->timestamp.end.handle,
+                                 gfx->timestamp.end.offset_B, sizeof(uint64_t));
+         hk_cmd_note_query_range(cmd, cmd->current_cs.post_gfx, req.handle,
+                                 req.offset_B, sizeof(uint64_t));
       } else {
          gfx->timestamp.end = req;
       }
@@ -1376,8 +1384,7 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       /* A query reset or earlier dispatch may have left a reusable stream.
        * Consume the start stamp before recording work into it too, rather
        * than resolving it as an end stamp at the next timestamp write. */
-      if (agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
-          agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+      if (agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
          st->cs_check_pending = true;
       return;
    }

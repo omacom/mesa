@@ -25,37 +25,13 @@
 bool
 agx_vdm_barrier_core_supported(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
    /* G18G memory barriers use the same word. */
-   case AGX_CHIP_G18G:
-      return true;
-
-   case AGX_CHIP_G13G:
-   case AGX_CHIP_G13X:
-   case AGX_CHIP_G14G:
-   case AGX_CHIP_G14X:
-   case AGX_CHIP_G15P:
-   case AGX_CHIP_G16P:
-   case AGX_CHIP_G17A:
-   case AGX_CHIP_UNKNOWN:
-   default:
-      return false;
-   }
+   return agx_chip_has_record(chip, AGX_RECORD_VDM_BARRIER);
 }
 
 bool
-agx_vdm_barrier_core_pack(enum agx_chip chip, struct agx_vdm_barrier_core *out)
+agx_vdm_barrier_core_pack(enum agx_chip chip, bool kernel_admits_inval,
+                          struct agx_vdm_barrier_core *out)
 {
    if (out)
       memset(out, 0, sizeof(*out));
@@ -63,7 +39,7 @@ agx_vdm_barrier_core_pack(enum agx_chip chip, struct agx_vdm_barrier_core *out)
    if (!out || !agx_vdm_barrier_core_supported(chip))
       return false;
 
-   agx_store_le32(out->bytes, agx_vdm_barrier_core_word(chip));
+   agx_store_le32(out->bytes, agx_vdm_barrier_core_word(chip, kernel_admits_inval));
    out->length = AGX_VDM_BARRIER_CORE_LENGTH;
    return true;
 }

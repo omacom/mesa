@@ -42,6 +42,7 @@
 #include "hk_descriptor_set.h"
 #include "hk_drm_render_core.h"
 #include "hk_ioto_arena_core.h"
+#include "hk_nir_root_size.h"
 #include "hk_pipeline_statistics_core.h"
 
 #include "asahi/lib/agx_nir_lower_vbo.h"
@@ -85,9 +86,11 @@ struct hk_g17p_prepared_bind_tail {
    uint64_t descriptor_generation;
    uint64_t vertex_buffer_generation;
    uint64_t root;
-   /* The fragment shader variant the tail launches and the uniform-DMA set
-    * base its program was built with (hk_g17p_dma_set_base()). */
+   /* The fragment shader variant the tail launches, its published stage
+    * program address, and the uniform-DMA set base its program was built
+    * with (hk_g17p_dma_set_base()). */
    const struct hk_shader *fragment_shader;
+   uint64_t fragment_program;
    uint64_t fragment_dma_set_base;
    struct hk_image_view *render_color0;
    struct hk_image_view *render_depth;
@@ -1124,8 +1127,13 @@ struct hk_cs {
    /* AGX3 CDM: the value of current just after a strong flush that also has
     * memory scope (AGX3_CDM_BARRIER_FLUSH_MEMORY): on G17P and M5 the
     * flushes hk_cdm_visibility_flush() asks for, and on M5 also the driver's
-    * own (hk_cdm_cache_flush()). */
+    * own (hk_cdm_cache_flush()). A patch site written later
+    * (struct hk_alias_site) does not move it. */
    void *memory_flush_end;
+
+   /* M5: patch sites recorded in this stream (hk_cmd_buffer::alias_sites),
+    * which a merge moves with its bytes. */
+   uint32_t alias_sites;
 
    /* AGX3 CDM: the value of current just after a standalone barrier that is
     * the stream's *first* record. Apple's emitter only opens a stream with a
@@ -1229,6 +1237,11 @@ struct hk_cs {
     * accelerates queries. Implies CDM.
     */
    struct util_dynarray imm_writes;
+   /* Bound query-pool byte ranges (struct hk_query_access_range) written by
+    * imm_writes above, kept separate from oq_stamps so fallback availability
+    * stores and deferred occlusion joins preserve GPU query access tracking. */
+   struct util_dynarray imm_write_query_ranges;
+   bool imm_write_query_untracked;
 
    /* Native private-memory profiles for every dispatch in this stream. */
    struct util_dynarray compute_resources;
@@ -1286,6 +1299,15 @@ struct hk_cs {
 
    /* A query copy or reset was recorded into this stream. */
    bool query_access;
+
+   /* Query words in kernel-bound timestamp buffers this stream reads or
+    * writes (struct hk_query_access_range): copies, resets, availability
+    * stores, acceleration-structure properties and timestamp copies. These
+    * decide DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS (hk_query_stamps_conflict());
+    * query_access above does not. untracked: a word could not be recorded,
+    * so the flag is omitted. */
+   bool query_access_untracked;
+   struct util_dynarray query_access_ranges;
 
    /* The stream ends with a strong, memory-scoped flush
     * (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION).
@@ -1399,6 +1421,19 @@ struct hk_cs {
       uint8_t viewport_count;
    } g17p_draw_state;
 
+   /* G17P / HAL200: the last complete bind tail published into this VDM
+    * stream.  Every record in that tail latches independently in PPP state,
+    * so a subsequent draw whose only changed tail input is the fragment
+    * program can elide the tail (when the fragment program is unchanged) or
+    * emit a single 8-byte PPP_STATE_UPDATE for the 28-byte fragment record. */
+   struct {
+      uint64_t fs_program;
+      uint32_t state_compact;
+      uint32_t scissor_size, depth_bias_size;
+      uint8_t viewport_count;
+      bool valid;
+   } g17p_bind_tail;
+
    /* We can only set ppp_multisamplectl once per batch. has_sample_locations
     * tracks if we've committed to a set of sample locations yet. vk_meta
     * operations do not set has_sample_locations since they don't care and it
@@ -1444,6 +1479,13 @@ hk_sync_later(struct hk_cs *a, struct hk_cs *b)
 
 void *hk_cmd_buffer_emit_cs_jump(struct hk_cmd_buffer *cmd, void *current,
                                  uint64_t target, bool vdm);
+
+/* Moves the patch sites of cmd in [from, from_end), copied to `to` without
+ * their first `skip` bytes, which were folded into the record just before
+ * `to` (hk_cs_merge_cdm_until()). */
+void hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd,
+                                    const void *from, const void *from_end,
+                                    uint8_t *to, size_t skip);
 
 /*
  * Helper to merge two compute control streams, concatenating the second control
@@ -1500,6 +1542,11 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
 
       memcpy(dst, (const uint8_t *)b->start + b_skip, b_size - b_skip);
       a->current = dst + (b_size - b_skip);
+      /* b's patch sites are in the copy now. Submit packing copies other
+       * command buffers' streams, whose sites stay with their recording. */
+      if (b->alias_sites && a->cmd == b->cmd)
+         hk_cmd_buffer_move_alias_sites(a->cmd, b->start, b_current, dst,
+                                        b_skip);
 
       /* These markers point just past an emitted barrier. Preserve them in
        * the destination root so another adjacent merge still has an exact
@@ -1536,6 +1583,7 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
       a->app_dispatch_end = NULL;
    }
 
+   a->alias_sites += b->alias_sites;
    a->uses_sampler_heap |= b->uses_sampler_heap;
    a->gen1_native_rq |= b->gen1_native_rq;
    a->as_build |= b->as_build;
@@ -1587,6 +1635,17 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
    a->stats.query_reset_queries += b->stats.query_reset_queries;
    a->stats.query_reset_flushes += b->stats.query_reset_flushes;
    a->query_access |= b->query_access;
+   a->query_access_untracked |= b->query_access_untracked;
+   if (b->query_access_ranges.size) {
+      if (!a->query_access_ranges.data)
+         a->query_access_ranges = UTIL_DYNARRAY_INIT;
+      void *dst = util_dynarray_grow_bytes(&a->query_access_ranges, 1,
+                                           b->query_access_ranges.size);
+      if (dst)
+         memcpy(dst, b->query_access_ranges.data, b->query_access_ranges.size);
+      else
+         a->query_access_untracked = true;
+   }
    assert(!a->query_reset_pending && !b->query_reset_pending);
 
    /* Frame anatomy: the merged command runs b's programs too. Without them
@@ -1708,6 +1767,10 @@ struct hk_cmd_buffer {
       struct {
          uint64_t id, addr;
       } constant_data[MESA_SHADER_STAGES];
+      struct hk_group_count_cache_entry {
+         uint32_t x, y, z, valid;
+         uint64_t addr;
+      } group_count_cache[16];
       /* vkCmdBindDescriptorBuffersEXT() */
       uint64_t descriptor_buffers[HK_MAX_DESCRIPTOR_BUFFERS];
       struct hk_graphics_state gfx;
@@ -1857,6 +1920,10 @@ struct hk_cmd_buffer {
    /* Does the command buffer use the geometry heap? */
    bool uses_heap;
 
+   /* The push descriptor sets hk_meta_begin() saves, each only as long as
+    * its layout, stacked in the order nested meta operations begin. */
+   struct util_dynarray meta_push_saves;
+
    /* Owned BOs and retained references needed by recorded commands. */
    struct util_dynarray large_bos;
    /* Direct-mapped temporal cache avoids rescanning large_bos for the linked
@@ -1882,7 +1949,46 @@ struct hk_cmd_buffer {
     * large_bos, so it dies with the recording like every other program
     * reference. */
    struct hk_ioto_arena ioto;
+
+   /* M5 with hk_device::host_alias.dynamic: the application dependencies
+    * recorded without memory scope (struct hk_alias_site), written once an
+    * import may alias (hk_cdm_alias_scope()). alias_patched (atomic) once
+    * they are; alias_registered (atomic) while alias_link is in
+    * hk_device::host_alias.cmd_buffers. */
+   struct util_dynarray alias_sites;
+   uint32_t alias_patched;
+   uint32_t alias_registered;
+   struct list_head alias_link;
 };
+
+/* A patch site: the stream word of a barrier record an application
+ * dependency was recorded with, without memory scope, because no host import
+ * could alias then (hk_cdm_alias_scope()). `value` is the memory-scoped
+ * strong flush (hk_device::host_alias.flush_word), which only strengthens
+ * the record: a weak ordering record, or a strong flush, becomes the strong
+ * flush with memory scope, as hk_cdm_flush() upgrades in place. A
+ * site stays a barrier record for the life of the recording: an application
+ * dispatch after it no longer drops it, and a merge that folds a leading
+ * barrier over it writes a barrier. */
+struct hk_alias_site {
+   uint32_t *word;
+   uint32_t value;
+};
+
+/* Whether an application dependency recorded now needs memory scope: as
+ * hk_cdm_alias_scope(), and also, with host_alias.dynamic, in a command
+ * buffer that uses events. */
+bool hk_cmd_alias_scope(struct hk_cmd_buffer *cmd);
+
+/* After an application dependency was recorded into cs without memory scope
+ * because hk_cmd_alias_scope() was false: with host_alias.dynamic, records
+ * the stream's last record as a patch site, or, without such a record,
+ * flushes with memory scope now. */
+void hk_cdm_note_alias_site(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+
+/* Writes the command buffer's patch sites, once. Callers ensure no reset
+ * runs concurrently; two writers write the same words. */
+void hk_cmd_buffer_patch_alias_sites(struct hk_cmd_buffer *cmd);
 
 /* Transfer entry points bracket their recording so the streams they create
  * belong to the transfer stage class (VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT and
@@ -2422,6 +2528,134 @@ hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
    gfx->shaders_dirty = ~0;
    gfx->linked_dirty = ~0;
    gfx->descriptors.root_dirty = true;
+   gfx->g17p_bind_tail_memo.valid = false;
+   if (cmd->current_cs.gfx)
+      cmd->current_cs.gfx->g17p_bind_tail.valid = false;
+}
+
+static inline size_t
+hk_gfx_root_descriptor_size(const struct hk_cmd_buffer *cmd)
+{
+   const size_t full = sizeof(struct hk_root_descriptor_table);
+   const struct hk_graphics_state *gfx = &cmd->state.gfx;
+   if (gfx->shaders[MESA_SHADER_TESS_CTRL] ||
+       gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       gfx->shaders[MESA_SHADER_GEOMETRY] ||
+       gfx->shaders[MESA_SHADER_TASK] ||
+       gfx->shaders[MESA_SHADER_MESH] ||
+       !gfx->shaders[MESA_SHADER_VERTEX])
+      return full;
+
+   const struct hk_shader *vs =
+      &gfx->shaders[MESA_SHADER_VERTEX]->variants[HK_VS_VARIANT_HW];
+   if (!vs->compiled)
+      return full;
+
+   struct hk_api_shader *fs_obj =
+      gfx->mesh_fs ? gfx->mesh_fs
+      : (gfx->fbl_fs ? gfx->fbl_fs : gfx->shaders[MESA_SHADER_FRAGMENT]);
+   uint32_t fs_size = 0;
+   if (fs_obj) {
+      const struct hk_shader *fs = hk_fs_variant(
+         fs_obj, cmd->vk.dynamic_graphics_state.ms.rasterization_samples);
+      if (!fs || !fs->compiled)
+         return full;
+      fs_size = fs->root_descriptor_size;
+   }
+
+   return hk_gfx_root_size_from_stages(vs->root_descriptor_size, fs_obj != NULL,
+                                       fs_size, full);
+}
+
+struct hk_query_access_range {
+   uint32_t handle;
+   uint64_t start_B;
+   uint64_t end_B;
+};
+
+/* Record a bound query-pool byte range in ranges. Handle 0 (no kernel
+ * timestamp binding) and empty ranges have nothing the kernel publishes and
+ * record nothing; a range that cannot be recorded sets *untracked, which
+ * fails closed (no DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS). */
+static inline void
+hk_query_ranges_note(struct util_dynarray *ranges, bool *untracked,
+                     uint32_t handle, uint64_t start_B, uint64_t size_B)
+{
+   if (!handle || !size_B)
+      return;
+
+   if (size_B > UINT64_MAX - start_B) {
+      *untracked = true;
+      return;
+   }
+
+   if (!ranges->data)
+      *ranges = UTIL_DYNARRAY_INIT;
+
+   struct hk_query_access_range *slot =
+      util_dynarray_grow_bytes(ranges, 1, sizeof(*slot));
+   if (!slot) {
+      *untracked = true;
+      return;
+   }
+
+   *slot = (struct hk_query_access_range){
+      .handle = handle,
+      .start_B = start_B,
+      .end_B = start_B + size_B,
+   };
+}
+
+/* A query word this stream reads or writes. Only decides
+ * DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS; it does not set query_access, which
+ * records copies and resets alone. Recording paths use the hk_cmd_ forms
+ * below. */
+static inline void
+hk_cs_note_query_range(struct hk_cs *cs, uint32_t handle, uint64_t start_B,
+                       uint64_t size_B)
+{
+   if (cs)
+      hk_query_ranges_note(&cs->query_access_ranges,
+                           &cs->query_access_untracked, handle, start_B,
+                           size_B);
+}
+
+/* A query word written by a queued immediate write (imm_writes). Moves to
+ * query_access_ranges when the writes are dispatched. */
+static inline void
+hk_cs_note_imm_write_query_range(struct hk_cs *cs, uint32_t handle,
+                                 uint64_t start_B, uint64_t size_B)
+{
+   if (cs)
+      hk_query_ranges_note(&cs->imm_write_query_ranges,
+                           &cs->imm_write_query_untracked, handle, start_B,
+                           size_B);
+}
+
+/* Words are recorded only where the kernel accepts
+ * DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: elsewhere nothing reads them. */
+static inline bool
+hk_cmd_tracks_query_ranges(const struct hk_cmd_buffer *cmd)
+{
+   return hk_cmd_buffer_device(cmd)->dev.params.features &
+          DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS;
+}
+
+static inline void
+hk_cmd_note_query_range(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                        uint32_t handle, uint64_t start_B, uint64_t size_B)
+{
+   if (hk_cmd_tracks_query_ranges(cmd))
+      hk_cs_note_query_range(cs, handle, start_B, size_B);
+}
+
+static inline void
+hk_cmd_note_imm_write_query_range(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                                  uint32_t handle, uint64_t start_B,
+                                  uint64_t size_B)
+{
+   if (hk_cmd_tracks_query_ranges(cmd))
+      hk_cs_note_imm_write_query_range(cs, handle, start_B, size_B);
 }
 
 static inline void
@@ -2434,7 +2668,9 @@ hk_cs_destroy(struct hk_cs *cs)
       util_dynarray_fini(&cs->depth_bias);
    } else {
       util_dynarray_fini(&cs->imm_writes);
+      util_dynarray_fini(&cs->imm_write_query_ranges);
       util_dynarray_fini(&cs->oq_stamps);
+      util_dynarray_fini(&cs->query_access_ranges);
    }
 
    free(cs);
@@ -2451,7 +2687,8 @@ void *hk_cmd_buffer_emit_vdm_terminate(struct hk_cmd_buffer *cmd,
                                        void *current);
 
 /* Ends a compute stream holding launches with a flush that has memory scope
- * while hk_cdm_alias_scope() asks for it. */
+ * while hk_cmd_alias_scope() asks for it; otherwise its last record is a
+ * patch site (hk_cdm_note_alias_site()). */
 void hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
 static void
@@ -2516,7 +2753,7 @@ hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
 
    if (cs) {
       struct hk_device *dev = hk_cmd_buffer_device(cmd);
-      const bool full_usc_state = agx_native_graphics(&dev->dev);
+      const bool full_usc_state = agx_chip_native_agx3(dev->dev.chip);
       /* Scissor and depth bias arrays are staged to dynamic arrays on the
        * CPU. When we end the control stream, they're done growing and are
        * ready for upload. G17P's ISP consumes these as full bit-40-set GART
@@ -2657,6 +2894,8 @@ void hk_cmd_upload_draw_id(struct hk_cmd_buffer *cmd, uint32_t draw_id);
 uint64_t hk_cmd_upload_constants(struct hk_cmd_buffer *cmd,
                                  const struct hk_shader *shader,
                                  mesa_shader_stage stage);
+uint64_t hk_cmd_upload_group_count(struct hk_cmd_buffer *cmd,
+                                   VkDispatchIndirectCommand group_count);
 void hk_cmd_print_upload_stats(struct hk_cmd_buffer *cmd);
 
 uint64_t hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
@@ -2676,8 +2915,7 @@ hk_reserve_scratch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * SPECTPR. There is no helper-program stack, and the kernel rejects a
     * command that names one. */
    if ((s->b.info.scratch_size == 0 && s->b.info.preamble_scratch_size == 0) ||
-       agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
-       agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+       agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip))
       return;
 
    hk_reserve_scratch_slow(cmd, cs, s);
@@ -2689,7 +2927,7 @@ static inline bool
 hk_sync_image_class(const struct hk_cmd_buffer *cmd)
 {
    const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
-   return chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip);
+   return agx_chip_g17p_or_m5(chip);
 }
 
 /* AGX2 returns its shader-base-relative USC offset.  G17P returns the absolute
@@ -2758,6 +2996,9 @@ void hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
 bool hk_gen1_upload_fragment_query_state(struct hk_cmd_buffer *cmd, bool vertex_stage,
    struct agx3_ioto_uniform_range *range);
+bool hk_gen1_upload_rq_uniforms(struct hk_cmd_buffer *cmd, uint32_t *context,
+                                unsigned context_words, bool profile,
+                                struct agx3_ioto_uniform_range *range);
 
 void hk_g17p_prewarm_linked_compute_shader(struct hk_device *dev,
                                             struct hk_shader *s,
@@ -2789,7 +3030,8 @@ struct hk_meta_save {
    uint64_t buffer_set0;
    uint32_t buffer_set_size0;
    enum agx_visibility_mode occlusion;
-   struct hk_push_descriptor_set push_desc0;
+   /* Where in hk_cmd_buffer::meta_push_saves the saved push set 0 starts */
+   uint32_t push_desc0_offset;
    VkQueryPipelineStatisticFlags pipeline_stats_flags;
    uint8_t push[HK_MAX_PUSH_SIZE];
    /* The runtime's record of stages bound from a pipeline. */
@@ -2831,7 +3073,7 @@ hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       hk_dispatch_m5_native(cmd, cs, s, grid, local_size);
       return;
    }
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_chip_native_agx3(dev->dev.chip)) {
       hk_reserve_scratch(cmd, cs, s);
       hk_dispatch_g17p_native(cmd, cs, s, grid, local_size);
       /* Software graphics stages communicate through memory: VS outputs,

@@ -91,7 +91,7 @@ hk_hash_device_generation_contract(blake3_hasher *ctx,
 static bool
 hk_shader_fma_supported(enum agx_chip chip)
 {
-   return (chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip)) &&
+   return agx_chip_g17p_or_m5(chip) &&
           agx_chip_exact_fma32(chip);
 }
 
@@ -104,7 +104,7 @@ hk_get_device_extensions(const struct agx_device *dev,
     * implementations have been qualified there. Native AGX3 and M5 keep
     * their existing exposure.
     */
-   const bool native_agx3 = (agx_native_graphics(dev) &&
+   const bool native_agx3 = (agx_chip_native_agx3(dev->chip) &&
                              dev->params.gpu_generation > 15) ||
                             agx_chip_g17_m5(dev->chip);
 
@@ -255,7 +255,7 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_dma_buf = true,
       .EXT_external_memory_host = agx_has_userptr(dev),
-      .EXT_fragment_shader_interlock = agx_native_graphics(dev),
+      .EXT_fragment_shader_interlock = agx_chip_native_agx3(dev->chip),
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
@@ -427,8 +427,7 @@ hk_get_device_features(
       .storagePushConstant16 = true,
       /* HAL200 interpolation is 32-bit, but the compiler performs matching
        * type-correct widening at ST_VARY and narrowing after interpolation. */
-      .storageInputOutput16 = agx_chip_native_agx3(dev->chip) ||
-                              agx_chip_g17_m5(dev->chip),
+      .storageInputOutput16 = agx_chip_native_or_m5(dev->chip),
       .multiview = true,
       /* ViewIndex is lowered into the layer output of the last
        * pre-rasterization stage and the draw is duplicated per view, so
@@ -1170,7 +1169,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .apiVersion = hk_get_vk_version(),
       .driverVersion = vk_get_driver_version(),
       .vendorID = instance->drirc.debug.force_vk_vendor ?: VK_VENDOR_ID_MESA,
-      .deviceID = (agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip))
+      .deviceID = agx_chip_native_or_m5(dev->chip)
                      ? dev->params.chip_id : 0,
       .deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU,
 
@@ -1326,16 +1325,17 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxMeshOutputLayers = 8,
       /* A multiview mesh draw replays once per view (hk_foreach_view walks
        * every bit of the 32-bit view mask) and writes the view index to the
-       * layer, so mesh shaders take as many views as every other stage.
+       * layer, so mesh shaders could take HK_MAX_MULTIVIEW_VIEW_COUNT views.
        *
-       * VK-GL-CTS dEQP-VK.mesh_shader.ext.properties.max_view_index builds
-       * its view mask as (1u << count) - 1u, which is undefined for 32
-       * views (on AArch64 it yields 0, and only layer 0 is drawn), so that
-       * case fails against this limit until the CTS computes the mask
-       * without the overflowing shift.
+       * Report 16 until VK-GL-CTS is fixed:
+       * dEQP-VK.mesh_shader.ext.properties.max_view_index draws with
+       * min(maxMeshMultiviewViewCount, 32) views and builds its subpass view
+       * mask as (1u << count) - 1u. At 32 views the shift is undefined; on
+       * AArch64 it shifts by count mod 32, the mask becomes 0, the pass is
+       * not multiview, only layer 0 is drawn and the case fails. Raise this
+       * once the CTS has KhronosGroup/VK-GL-CTS#661 (aurora-silicon/mesa#516).
        */
-      .maxMeshMultiviewViewCount =
-         features->multiviewMeshShader ? HK_MAX_MULTIVIEW_VIEW_COUNT : 1,
+      .maxMeshMultiviewViewCount = features->multiviewMeshShader ? 16 : 1,
       .meshOutputPerVertexGranularity = 32,
       .meshOutputPerPrimitiveGranularity = 32,
       .maxPreferredTaskWorkGroupInvocations = 32,
@@ -2055,15 +2055,30 @@ hk_physical_device_free_disk_cache(struct hk_physical_device *pdev)
 #endif
 }
 
-static uint64_t
+uint64_t
 hk_get_sysmem_heap_size(struct hk_physical_device *pdev)
 {
-   if (pdev->sysmem)
+   uint64_t total_ram_B = 0;
+   const bool has_mem = os_get_total_physical_memory(&total_ram_B);
+
+   if (pdev->sysmem) {
+      if (has_mem && total_ram_B > 0) {
+         float pct = (float)((double)pdev->sysmem / (double)total_ram_B);
+         pdev->sysmem_heap_percent = CLAMP(pct, FLT_MIN, 1.0f);
+      } else {
+         pdev->sysmem_heap_percent = 1.0f;
+      }
       return pdev->sysmem;
+   }
+
+   if (!has_mem)
+      return 0;
 
    struct hk_instance *instance = hk_physical_device_instance(pdev);
-   return os_get_gpu_heap_size(instance->drirc.misc.heap_memory_percent,
-                               &instance->drirc.misc.heap_memory_percent);
+   return hk_resolve_uma_sysmem_heap(
+      total_ram_B, instance->drirc.misc.heap_memory_percent,
+      pdev->dev.has_memory_limits, pdev->dev.params.memory_limit,
+      pdev->dev.params.client_memory_limit, &pdev->sysmem_heap_percent);
 }
 
 static simple_mtx_t hk_heap_usage_lock = SIMPLE_MTX_INITIALIZER;
@@ -2251,7 +2266,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    /* Counted by the pre-graphics helpers, which every native chip runs;
     * hardware-qualified on M5 and G17P. */
    supported_extensions.EXT_primitives_generated_query =
-      agx_chip_g17_m5(pdev->dev.chip) || pdev->dev.chip == AGX_CHIP_G17P;
+      agx_chip_g17p_or_m5(pdev->dev.chip);
 
    supported_extensions.EXT_mesh_shader = pdev->dev.chip == AGX_CHIP_G17S &&
       (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2);
@@ -2260,7 +2275,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    supported_extensions.EXT_sampler_filter_minmax =
       agx_chip_sampler_generation(pdev->dev.chip) == AGX_SAMPLER_GENERATION_GEN5;
 
-   if (agx_native_graphics(&pdev->dev)) {
+   if (agx_chip_native_agx3(pdev->dev.chip)) {
       supported_extensions.KHR_shader_quad_control =
          pdev->dev.chip == AGX_CHIP_G17P;
    }
@@ -2389,7 +2404,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    VkQueueFlags queue_flags =
       VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT |
       VK_QUEUE_SPARSE_BINDING_BIT;
-   if (agx_native_graphics(&pdev->dev)) {
+   if (agx_chip_native_agx3(pdev->dev.chip)) {
       /* Graphics, compute and transfers use the native HAL200 queue path.
        * Sparse binding rides the shared per-page VM_BIND path; advertise it
        * only when the same opt-in that turns on the sparse features above is
@@ -2520,7 +2535,6 @@ hk_GetPhysicalDeviceMemoryProperties2(
    VkPhysicalDeviceMemoryProperties2 *pMemoryProperties)
 {
    VK_FROM_HANDLE(hk_physical_device, pdev, physicalDevice);
-   struct hk_instance *instance = hk_physical_device_instance(pdev);
 
    pMemoryProperties->memoryProperties.memoryHeapCount = pdev->mem_heap_count;
    for (int i = 0; i < pdev->mem_heap_count; i++) {
@@ -2572,7 +2586,7 @@ hk_GetPhysicalDeviceMemoryProperties2(
                budget = ROUND_DOWN_TO((uint64_t)(budget * percent), 1 << 20);
             } else {
                /* Scale the budget the same way the heap was scaled. */
-               percent *= instance->drirc.misc.heap_memory_percent;
+               percent *= pdev->sysmem_heap_percent;
 
                budget = vk_physical_device_heap_budget_from_system(
                   &pdev->vk, percent, heap->size, used);

@@ -57,6 +57,27 @@ if with_tools.contains('drm-shim')
 endif
 
 if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
+  # HAL200 bind-tail elision / incremental 28B FS PPP update vs non-FS PPP
+  # state changes (scissor, viewport, cull mode, depth op, color blend).
+  test(
+    'hk-g17p-bind-tail-state-change',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_bind_tail_state_change,
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'ASAHI_SHIM_VALIDATE_G17P_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_VALID_STREAM=1',
+      'ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=6,2,2',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
   # Graphics-path copies from one layer of a block-compressed image into a
   # compressed G17P image; encoded and stream-validated, not executed.
   test(
@@ -114,6 +135,48 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     env : [
       'ASAHI_SHIM_CHIP=g17p',
       'ASAHI_SHIM_VALIDATE_G17P_STREAM=1',
+      'ASAHI_MESA_DEBUG=perf',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
+  # Aliased compressed attachments over host-filled memory; recorded and
+  # submitted, not executed (the hardware run needs the GPU).
+  test(
+    'hk-g17p-garbage-metadata',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_garbage_metadata,
+      '--shim',
+      '--expect-compressed',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'ASAHI_MESA_DEBUG=perf',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
+  # Aliased compressed attachments over host-filled memory; recorded and
+  # submitted, not executed (the hardware run needs the GPU).
+  test(
+    'hk-g16s-garbage-metadata',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_garbage_metadata,
+      '--shim',
+      '--expect-compressed',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g16s',
       'ASAHI_MESA_DEBUG=perf',
       'VK_DRIVER_FILES=' + _dev_icd.full_path(),
     ],
@@ -215,6 +278,27 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     ],
     depends : [_dev_icd, libvulkan_asahi],
     suite : ['asahi'],
+  )
+
+  # A render on one queue read by compute on another, ordered by timeline
+  # semaphores, including waits made by submissions without command buffers;
+  # recorded and submitted, not executed (the ordering check needs the GPU).
+  test(
+    'hk-g17p-cross-queue',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_cross_queue,
+      '--shim',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+    timeout : 120,
   )
 
   # Background/end-of-tile shader cache shared by command buffers recording

@@ -55,12 +55,8 @@ libasahi_agx_files = files(
   'agx3_isel_core.c',
   'agx3_iadd_core.c',
   'agx3_pack_binary.c',
-  'agx3_compose/agx3_compose.c',
-  'agx3_compose/agx3_decode.c',
-  'agx3_compose/agx3b_tables.c',
-  'agx3_compose/agx3c_tables.c',
-  'agx3_compose/agx3d_tables.c',
   'agx3_transcode.c',
+  'agx3_reencode_cache.c',
   'agx3_binder.c',
   'agx3_atomic_core.c',
   'agx3_cf_core.c',
@@ -172,11 +168,39 @@ idep_agx_builder_h = declare_dependency(
   include_directories : include_directories('.'),
 )
 
+# The AGX3 encoding tables, generated from their descriptions.
+agx3_tables_c = []
+foreach t : ['agx3b', 'agx3c', 'agx3d']
+  agx3_tables_c += custom_target(
+    input : ['agx3_compose/gen_agx3_tables.py',
+             'agx3_compose/@0@_tables.txt'.format(t)],
+    output : '@0@_tables.c'.format(t),
+    command : [prog_python, '@INPUT0@', '@INPUT1@', '-o', '@OUTPUT@'],
+    depend_files : files('agx3_compose/agx3_table.py'),
+  )
+endforeach
+
+# The AGX3 encoder, its inverse and the three encoding tables, built once for
+# the compiler, the drivers and every test. A static link takes only the
+# tables it references.
+libagx3_compose = static_library(
+  'agx3_compose',
+  files(
+    'agx3_compose/agx3_compose.c',
+    'agx3_compose/agx3_decode.c',
+  ),
+  agx3_tables_c,
+  include_directories : include_directories('agx3_compose'),
+  c_args : [no_override_init_args],
+  gnu_symbol_visibility : 'hidden',
+  build_by_default : false,
+)
+
 libasahi_compiler = static_library(
   'asahi_compiler',
   [libasahi_agx_files, agx_opcodes_c, agx_nir_algebraic_c],
   dependencies: [idep_nir, idep_agx_opcodes_h, idep_agx_builder_h, idep_mesautil, idep_libagx],
-  link_with : [libagx2_disasm, libagx3c_disasm, libagx3d_disasm],
+  link_with : [libagx3_compose, libagx2_disasm, libagx3c_disasm, libagx3d_disasm],
   c_args : [no_override_init_args, '-Wno-c2x-extensions',
             '-DAGX3_HAVE_AGX3D_TABLE'],
   gnu_symbol_visibility : 'hidden',
@@ -184,6 +208,27 @@ libasahi_compiler = static_library(
 )
 
 if with_tests
+  # The generated tables hold exactly the rows of the tables their
+  # descriptions were made from.
+  foreach t : ['agx3b', 'agx3c', 'agx3d']
+    test(
+      '@0@_tables'.format(t),
+      prog_python,
+      args : [files('agx3_compose/gen_agx3_tables.py'), '--verify',
+              files('agx3_compose/@0@_tables.txt'.format(t))],
+      suite : ['asahi'],
+    )
+  endforeach
+
+  # The generator refuses the rows the encoder applies without a test.
+  test(
+    'agx3_tables_refusals',
+    prog_python,
+    args : [files('test/test-gen-agx3-refusals.py'),
+            files('agx3_compose/gen_agx3_tables.py')],
+    suite : ['asahi'],
+  )
+
   # agx3_bind_compose()'s memo against the table walk, on every instruction
   # of the native witness texts.
   test(
@@ -192,18 +237,13 @@ if with_tests
       'agx3_bind_memo_test',
       files(
         'agx3_binder.c',
-        'agx3_compose/agx3_compose.c',
-        'agx3_compose/agx3_decode.c',
-        'agx3_compose/agx3b_tables.c',
-        'agx3_compose/agx3c_tables.c',
-        'agx3_compose/agx3d_tables.c',
         'test/test-agx3-bind-memo.c',
       ),
       c_args : [c_msvc_compat_args, no_override_init_args,
                 '-DAGX3_HAVE_AGX3D_TABLE'],
       gnu_symbol_visibility : 'hidden',
       include_directories : [inc_include, inc_src],
-      link_with : [libagx3c_disasm, libagx3d_disasm],
+      link_with : [libagx3_compose, libagx3c_disasm, libagx3d_disasm],
     ),
     suite : ['asahi'],
     args : [meson.project_source_root() / 'src/asahi/compiler/test/native/g18g'],
@@ -216,11 +256,9 @@ if with_tests
       files(
         'agx3_subgroup_core.c',
         'agx3_binder.c',
-        'agx3_compose/agx3_compose.c',
-        'agx3_compose/agx3b_tables.c',
-        'agx3_compose/agx3c_tables.c',
         'test/test-agx3-subgroup-core.c',
       ),
+      link_with : [libagx3_compose],
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       include_directories : [inc_include, inc_src],
@@ -262,12 +300,10 @@ if with_tests
       'agx3_falu_mod_core_test',
       files(
         'agx3_falu_mod_core.c',
-        'agx3_compose/agx3_compose.c',
-        'agx3_compose/agx3b_tables.c',
-        'agx3_compose/agx3c_tables.c',
         'agx3_binder.c',
         'test/test-agx3-falu-mod-core.c',
       ),
+      link_with : [libagx3_compose],
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       include_directories : [inc_include, inc_src],
@@ -281,12 +317,10 @@ if with_tests
       'agx3_vary_core_test',
       files(
         'agx3_vary_core.c',
-        'agx3_compose/agx3_compose.c',
-        'agx3_compose/agx3b_tables.c',
-        'agx3_compose/agx3c_tables.c',
         'agx3_binder.c',
         'test/test-agx3-vary-core.c',
       ),
+      link_with : [libagx3_compose],
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       include_directories : [inc_include, inc_src],
@@ -300,12 +334,10 @@ if with_tests
       'agx3_cf_core_test',
       files(
         'agx3_cf_core.c',
-        'agx3_compose/agx3_compose.c',
-        'agx3_compose/agx3b_tables.c',
-        'agx3_compose/agx3c_tables.c',
         'agx3_binder.c',
         'test/test-agx3-cf-core.c',
       ),
+      link_with : [libagx3_compose],
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       include_directories : [inc_include, inc_src],
@@ -319,12 +351,10 @@ if with_tests
       'agx3_mem_core_test',
       files(
         'agx3_mem_core.c',
-        'agx3_compose/agx3_compose.c',
-        'agx3_compose/agx3b_tables.c',
-        'agx3_compose/agx3c_tables.c',
         'agx3_binder.c',
         'test/test-agx3-mem-core.c',
       ),
+      link_with : [libagx3_compose],
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       include_directories : [inc_include, inc_src],
@@ -339,13 +369,11 @@ if with_tests
       files(
         'agx3_alu_core.c',
         'agx3_falu_mod_core.c',
-        'agx3_compose/agx3_compose.c',
-        'agx3_compose/agx3b_tables.c',
-        'agx3_compose/agx3c_tables.c',
         'agx3_binder.c',
         'agx3_pack.c',
         'test/test-agx3-alu-core.c',
       ),
+      link_with : [libagx3_compose],
       c_args : [c_msvc_compat_args, no_override_init_args, '-UNDEBUG'],
       gnu_symbol_visibility : 'hidden',
       include_directories : [inc_include, inc_src],
@@ -368,17 +396,31 @@ if with_tests
     suite : ['asahi'],
   )
 
+  # The encoder's selection in every exclusive choice group against the first
+  # alternative, in table order, whose predicates hold.
+  test(
+    'agx3_group_select',
+    executable(
+      'agx3_group_select_test',
+      files(
+        'test/test-agx3-group-select.c',
+      ),
+      link_with : [libagx3_compose],
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      include_directories : [inc_include, inc_src],
+    ),
+    suite : ['asahi'],
+  )
+
   test(
     'agx3_compose_corpus',
     executable(
       'agx3_compose_corpus_test',
       files(
-        'agx3_compose/agx3_compose.c',
-        'agx3_compose/agx3b_tables.c',
-        'agx3_compose/agx3c_tables.c',
-        'agx3_compose/agx3d_tables.c',
         'test/test-agx3-compose-corpus.c',
       ),
+      link_with : [libagx3_compose],
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       include_directories : [inc_include, inc_src],
@@ -408,11 +450,9 @@ if with_tests
       files(
         'agx3_iadd_core.c',
         'agx3_binder.c',
-        'agx3_compose/agx3_compose.c',
-        'agx3_compose/agx3b_tables.c',
-        'agx3_compose/agx3c_tables.c',
         'test/test-agx3-iadd-core.c',
       ),
+      link_with : [libagx3_compose],
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       include_directories : [inc_include, inc_src],
@@ -427,11 +467,9 @@ if with_tests
       files(
         'agx3_isel_core.c',
         'agx3_binder.c',
-        'agx3_compose/agx3_compose.c',
-        'agx3_compose/agx3b_tables.c',
-        'agx3_compose/agx3c_tables.c',
         'test/test-agx3-isel-core.c',
       ),
+      link_with : [libagx3_compose],
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       include_directories : [inc_include, inc_src],
@@ -446,11 +484,9 @@ if with_tests
       files(
         'agx3_copy_core.c',
         'agx3_binder.c',
-        'agx3_compose/agx3_compose.c',
-        'agx3_compose/agx3b_tables.c',
-        'agx3_compose/agx3c_tables.c',
         'test/test-agx3-copy-core.c',
       ),
+      link_with : [libagx3_compose],
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       include_directories : [inc_include, inc_src],
@@ -468,13 +504,11 @@ if with_tests
         'agx3_static_spill_core.c',
         'agx3_mem_core.c',
         'agx3_binder.c',
-        'agx3_compose/agx3_compose.c',
-        'agx3_compose/agx3b_tables.c',
-        'agx3_compose/agx3c_tables.c',
         '../lib/agx_ioto_core.c',
         '../lib/agx_ioto_load_core.c',
         'test/test-agx3-ioto-load-packer.c',
       ),
+      link_with : [libagx3_compose],
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       include_directories : [inc_include, inc_src],
@@ -494,9 +528,6 @@ if with_tests
         'agx3_static_spill_core.c',
         'agx3_mem_core.c',
         'agx3_binder.c',
-        'agx3_compose/agx3_compose.c',
-        'agx3_compose/agx3b_tables.c',
-        'agx3_compose/agx3c_tables.c',
         '../lib/agx_ioto_core.c',
         '../lib/agx_ioto_load_core.c',
         '../lib/agx_ioto_profile_core.c',
@@ -505,6 +536,7 @@ if with_tests
         '../lib/agx_ioto_program_core.c',
         'test/test-agx3-ioto-uniform-program.c',
       ),
+      link_with : [libagx3_compose],
       c_args : [c_msvc_compat_args, no_override_init_args],
       dependencies : [idep_mesautil],
       gnu_symbol_visibility : 'hidden',
@@ -585,11 +617,9 @@ if with_tests
       files(
         'agx3_pixel_core.c',
         'agx3_binder.c',
-        'agx3_compose/agx3_compose.c',
-        'agx3_compose/agx3b_tables.c',
-        'agx3_compose/agx3c_tables.c',
         'test/test-agx3-pixel-core.c',
       ),
+      link_with : [libagx3_compose],
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       include_directories : [inc_include, inc_src],
@@ -604,11 +634,9 @@ if with_tests
       files(
         'agx3_funop_core.c',
         'agx3_binder.c',
-        'agx3_compose/agx3_compose.c',
-        'agx3_compose/agx3b_tables.c',
-        'agx3_compose/agx3c_tables.c',
         'test/test-agx3-funop-core.c',
       ),
+      link_with : [libagx3_compose],
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       include_directories : [inc_include, inc_src],
@@ -644,9 +672,6 @@ if with_tests
         'agx3_static_spill_core.c',
         'agx3_mem_core.c',
         'agx3_binder.c',
-        'agx3_compose/agx3_compose.c',
-        'agx3_compose/agx3b_tables.c',
-        'agx3_compose/agx3c_tables.c',
         '../lib/agx_ioto_core.c',
         '../lib/agx_ioto_load_core.c',
         '../lib/agx_ioto_profile_core.c',
@@ -655,6 +680,7 @@ if with_tests
         '../lib/agx_ioto_program_core.c',
         'test/test-agx3-graphics-program.c',
       ),
+      link_with : [libagx3_compose],
       c_args : [c_msvc_compat_args, no_override_init_args],
       dependencies : [idep_mesautil],
       gnu_symbol_visibility : 'hidden',
@@ -686,6 +712,7 @@ if with_tests
          'test/test-scalarize-int64.cpp',
          'test/test-lower-divmod64.cpp',
          'test/test-spill-fallback.cpp',
+         'test/test-agx-register-cache.cpp',
          'test/test-rt-register-pressure.cpp',
          'test/test-uniform-remat.cpp',
          'test/test-lower-pseudo.cpp',
@@ -736,6 +763,7 @@ if with_tests
          'test/test-m5-half-widen-once.cpp',
          'test/test-m5-byte-to-float.cpp',
          'test/test-fold-narrowed-half.cpp',
+         'test/test-m5-float-minmax-reduce.cpp',
          'test/test-m5-copy-schedule.cpp',
          'test/test-preamble-flag-branches.cpp',
          'test/test-flatten-loads.cpp',
@@ -759,11 +787,9 @@ if with_tests
       files(
         'agx3_rt_core.c',
         'agx3_binder.c',
-        'agx3_compose/agx3_compose.c',
-        'agx3_compose/agx3b_tables.c',
-        'agx3_compose/agx3c_tables.c',
         'test/test-agx3-rt-core.c',
       ),
+      link_with : [libagx3_compose],
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       include_directories : [inc_include, inc_src],
@@ -918,6 +944,19 @@ if with_tests
     executable(
       'agx3_ray_query_prerequisites_test',
       files('test/test-agx3-ray-query-prerequisites.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx3_g17p_task_kernel_shared',
+    executable(
+      'agx3_g17p_task_kernel_shared_test',
+      files('test/test-agx3-g17p-task-kernel-shared.c'),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
       dependencies : [idep_nir, idep_mesautil],

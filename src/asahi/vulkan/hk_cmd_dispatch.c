@@ -687,6 +687,57 @@ hk_cdm_visibility_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
    hk_cdm_flush(dev, cs, memory);
 }
 
+bool
+hk_cmd_alias_scope(struct hk_cmd_buffer *cmd)
+{
+   const struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   return hk_cdm_alias_scope(dev) ||
+          (dev->host_alias.dynamic && cmd->state.uses_events);
+}
+
+void
+hk_cdm_note_alias_site(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!dev->host_alias.dynamic || cs->stats.cmds == 0)
+      return;
+
+   /* The record just before current: the strong flush or the last
+    * launch's ordering record. A marker equal to current means it is in the
+    * chunk being written. */
+   const bool strong = cs->current == cs->strong_flush_end;
+   if (strong && cs->current == cs->memory_flush_end)
+      return;
+
+   uint32_t *word =
+      (uint32_t *)((uint8_t *)cs->current - AGX3_CDM_BARRIER_SIZE);
+   if ((strong || cs->current == cs->weak_barrier_end) &&
+       !((uintptr_t)word & (sizeof(*word) - 1))) {
+      if (cmd->alias_sites.size &&
+          util_dynarray_top_ptr(&cmd->alias_sites, struct hk_alias_site)
+                ->word == word)
+         return;
+
+      struct hk_alias_site *site =
+         util_dynarray_grow(&cmd->alias_sites, struct hk_alias_site, 1);
+      if (site) {
+         *site = (struct hk_alias_site){
+            .word = word,
+            .value = dev->host_alias.flush_word,
+         };
+         cs->alias_sites++;
+         /* A following application dispatch must not drop the record
+          * (hk_dispatch_m5_native_impl()). */
+         cs->app_dispatch_end = NULL;
+         return;
+      }
+   }
+
+   /* No record to write later: give the dependency memory scope now. */
+   hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
+   hk_cdm_visibility_flush(dev, cs, true);
+}
+
 void
 hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
@@ -699,9 +750,17 @@ hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
     * command buffer or in a later one of the same submission. While memory
     * may be mapped at a second address, end the stream with memory scope.
     * Usually this only strengthens the last launch's ordering record in
-    * place. */
-   if (!hk_cdm_alias_scope(dev) || cs->stats.cmds == 0 ||
-       !hk_cdm_visibility_flush_needed(dev, cs, true))
+    * place. Where only a resource created later could map it there, that
+    * record is a patch site instead (hk_cdm_alias_scope()). */
+   if (cs->stats.cmds == 0)
+      return;
+
+   if (!hk_cmd_alias_scope(cmd)) {
+      hk_cdm_note_alias_site(cmd, cs);
+      return;
+   }
+
+   if (!hk_cdm_visibility_flush_needed(dev, cs, true))
       return;
 
    hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
@@ -1102,23 +1161,6 @@ hk_g17p_build_compute_program(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          range_count>=HK_G17P_COMPUTE_MAX_RANGES) {
          vk_command_buffer_set_error(&cmd->vk,VK_ERROR_FEATURE_NOT_PRESENT);return false;
       }
-      const uint64_t packed = hk_gen1_ray_query_scs_layout(dev);
-      struct agx_scs_layout_gen2 scs;
-      if (!agx_scs_layout_gen1_init(packed, &scs)) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return false;
-      }
-      const uint64_t state = hk_gen1_query_state(cmd, &scs);
-      struct agx_ptr u=hk_pool_alloc(cmd,512,16);
-      if(!state || !u.cpu)return false;
-      memset(u.cpu,0,512);memcpy(u.cpu,dev->gen1_rq_uniforms,320);
-      for(unsigned i=0;i<74;i+=2) {
-         uint64_t value;memcpy(&value,(uint8_t*)u.cpu+4*i,8);
-         if(value>=UINT64_C(0x20d0000000) && value<UINT64_C(0x20d0060000)) {
-            value+=state-UINT64_C(0x20d0000000);
-            memcpy((uint8_t*)u.cpu+4*i,&value,8);
-         }
-      }
       uint32_t context[28]={0,0,0x60000070,0x280000,0,0,0,0,0,64,1,1,
                              0,0,1,1,0,0x6f,0,0,0x2f8000,0,0,0,0,0,
                              0x00400040,0x7fff0005};
@@ -1132,38 +1174,10 @@ hk_g17p_build_compute_program(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return false;
       }
-      uint64_t table=state+0x50000,ctx=u.gpu+352;
-      if (dev->gen1_rq_instances) {
-         table=hk_gen1_upload_as_table(cmd);
-         if (!table) return false;
-         const uint32_t constants[]={0x3f7ffffe,0x3f800001,0x6000,0x8000,
-            0xfe00001,0x1000,0x100,0x10002,0x1ffff,0x20000,0x400000,
-            0x1f000000,0x34a00000,0x40000000,0xfffeff00};
-         memcpy((uint8_t *)u.cpu+118*2,constants,sizeof(constants));
-         uint32_t *uw=u.cpu;
-         uw[106/2]=88;
-         uw[48/2]=scs.end[6];uw[50/2]=scs.end[11];
-         uw[52/2]=packed;uw[54/2]=packed>>32;
-         memcpy((uint8_t *)u.cpu+32*2,&table,8);
-         context[2]=packed;context[3]=packed>>32;
-         context[20]=scs.end[5];
-
-      }
-      if(dev->gen1_rq_candidates) {
-         const uint32_t constants[]={0x3fffffff,0x3f7ffffe,0x3f800001,
-            0x6000,0x8000,0x10000,0x60400,0x3ffd0fe0,0x914348a1,
-            0x100,0x10002,0x1ffff,0x20000,0xfffff,0x400000,
-            0x1f000001,0x34a00000,0xfe000000,0xfe1ffffe,0xfffe0000,0xfffeff00};
-         memcpy((uint8_t*)u.cpu+110*2,constants,sizeof(constants));
-         ((uint32_t*)u.cpu)[104/2]=304;
-      }
-      memcpy(context+12,&table,8);memcpy((uint8_t*)u.cpu+352,context,sizeof(context));
-      memcpy((uint8_t*)u.cpu+320,&ctx,8);memcpy((uint8_t*)u.cpu+328,&table,8);
-      ranges[range_count++]=(struct agx3_ioto_uniform_range){
-         .start_halfs=0,.size_halfs=168,.address=u.gpu,
-      };
-      hk_cmd_buffer_retain_bo(cmd,dev->gen1_rq_code);
-      hk_cmd_buffer_retain_bo(cmd,dev->gen1_rq_ift);
+      if (!hk_gen1_upload_rq_uniforms(cmd, context, ARRAY_SIZE(context),
+                                      false, &ranges[range_count]))
+         return false;
+      range_count++;
       if (!cs) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
          return false;
@@ -1197,7 +1211,7 @@ hk_g17p_prewarm_linked_compute_program_kind(
    struct hk_linked_shader *linked, bool internal_graphics,
    enum agx_ioto_g17p_compute_ldshdr_f1 kind)
 {
-   if (!agx_native_graphics(&dev->dev) ||
+   if (!agx_chip_native_agx3(dev->dev.chip) ||
        !hk_g17p_compute_shader_supported(dev->dev.chip, s, linked,
                                          AGX3_G17P_MAX_COMPUTE_SPILL_B))
       return;
@@ -1493,7 +1507,7 @@ hk_dispatch_precomp_g17p(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   if (!agx_native_graphics(&dev->dev) || !prog->bo ||
+   if (!agx_chip_native_agx3(dev->dev.chip) || !prog->bo ||
        !prog->info.main_size || !prog->info.nr_gprs ||
        prog->info.nr_preamble_gprs ||
        (prog->info.rodata.size_16 && !prog->rodata_offset) ||
@@ -2015,7 +2029,7 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    static_assert(HK_MAX_SETS == HK_AGX3_G17P_MAX_ROOT_SETS,
                  "G17P root range must cover every Honeykrisp set");
 
-   if (!agx_native_graphics(&dev->dev) || cs->type != HK_CS_CDM ||
+   if (!agx_chip_native_agx3(dev->dev.chip) || cs->type != HK_CS_CDM ||
        !hk_g17p_compute_shader_supported(dev->dev.chip, s, linked,
                                          AGX3_G17P_MAX_COMPUTE_SPILL_B)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -3025,8 +3039,7 @@ hk_cmd_dispatch_unaligned(VkCommandBuffer commandBuffer, uint32_t invocations_x,
       .y = DIV_ROUND_UP(invocations_y, s->b.info.workgroup_size[1]),
       .z = DIV_ROUND_UP(invocations_z, s->b.info.workgroup_size[2]),
    };
-   desc->root.cs.group_count_addr =
-      hk_pool_upload(cmd, &group_count, sizeof(group_count), 8);
+   desc->root.cs.group_count_addr = hk_cmd_upload_group_count(cmd, group_count);
    desc->root.cs.grid_helper_sparse_map_addr = 0;
 
    dispatch_grid(cmd, agx_3d(invocations_x, invocations_y, invocations_z),
@@ -3057,8 +3070,7 @@ hk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX,
       .z = groupCountZ,
    };
 
-   desc->root.cs.group_count_addr =
-      hk_pool_upload(cmd, &group_count, sizeof(group_count), 8);
+   desc->root.cs.group_count_addr = hk_cmd_upload_group_count(cmd, group_count);
    desc->root.cs.grid_helper_sparse_map_addr = 0;
 
    dispatch(cmd, agx_3d(groupCountX, groupCountY, groupCountZ));
@@ -3186,7 +3198,7 @@ hk_CmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer _buffer,
     * arguments through the shadow there. */
    const bool have_sparse_helper = dev->g17p_grid_helper_sparse != NULL;
    const bool use_primary =
-      agx_native_graphics(&dev->dev) && buffer->va &&
+      agx_chip_native_agx3(dev->dev.chip) && buffer->va &&
       (!buffer->sparse_map || have_sparse_helper);
 
    uint64_t dispatch_addr = hk_buffer_address(buffer, offset, !use_primary);

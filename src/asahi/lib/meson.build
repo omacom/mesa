@@ -226,6 +226,43 @@ if with_tests
     suite : ['asahi'],
   )
   test(
+    'asahi-g18g-graphics-template',
+    executable(
+      'asahi-g18g-graphics-template',
+      files('tests/test-g18g-graphics-template.c'),
+      include_directories : [inc_asahi, inc_include, inc_src],
+      dependencies : [idep_agx_pack, idep_mesautil, idep_nir],
+      link_with : [libasahi_lib, libasahi_compiler, libasahi_layout],
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+  test(
+    'asahi-g18g-template-policy',
+    executable(
+      'asahi-g18g-template-policy',
+      files('tests/test-g18g-template-policy.c'),
+      include_directories : [inc_include, inc_src],
+      c_args : [c_msvc_compat_args],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+  test(
+    'asahi-g18g-reencode-cache',
+    executable(
+      'asahi-g18g-reencode-cache',
+      files('tests/test-g18g-reencode-cache.c'),
+      include_directories : [inc_asahi, inc_include, inc_src],
+      dependencies : [idep_agx_pack, idep_mesautil, idep_nir],
+      link_with : [libasahi_lib, libasahi_compiler, libasahi_layout],
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+  test(
     'asahi-usc-base-page',
     executable(
       'asahi-usc-base-page',
@@ -242,11 +279,12 @@ if with_tests
     'asahi-agx-chip',
     executable(
       'asahi-agx-chip',
-      files(
-        'agx_chip.c',
-        'tests/test-chip.c',
-      ),
+      files('tests/test-chip.c'),
       include_directories : [inc_include, inc_src, inc_asahi],
+      dependencies : [idep_agx_pack, idep_mesautil],
+      link_with : [libasahi_lib],
+      c_args : [c_msvc_compat_args],
+      gnu_symbol_visibility : 'hidden',
     ),
     suite : ['asahi'],
   )
@@ -286,6 +324,18 @@ if with_tests
     executable(
       'asahi-g17p-srgb-epilog',
       files('tests/test-agx-g17p-srgb-epilog.c'),
+      include_directories : [inc_include, inc_src, inc_asahi],
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_lib, libasahi_compiler, libasahi_layout],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'asahi-uvs-relocatable',
+    executable(
+      'asahi-uvs-relocatable',
+      files('tests/test-agx-uvs-relocatable.c'),
       include_directories : [inc_include, inc_src, inc_asahi],
       dependencies : [idep_nir, idep_mesautil],
       link_with : [libasahi_lib, libasahi_compiler, libasahi_layout],

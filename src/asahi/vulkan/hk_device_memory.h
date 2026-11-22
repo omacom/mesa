@@ -39,12 +39,23 @@ struct hk_device_memory {
    size_t map_size;
    bool map_owned;
 
+   /* The mapping host image copies go through (hk_device_memory_copy_map()),
+    * NULL until the first copy. It covers the whole BO and lives until
+    * vkFreeMemory. */
+   void *copy_map;
+
    /* Residency preference the kernel accepted (memory priority 1.0). */
    bool keep_resident;
 
    /* An import the GPU may write that another import can map at a second
     * address too: counted in hk_device::va_alias_resources while it lives. */
    bool alias_import;
+
+   /* A host import in hk_device::host_alias.imports (M5, host_alias.dynamic). */
+   bool host_alias_tracked;
+   /* An fd or dma-buf import, counted in hk_device::alias_live for its
+    * lifetime (hk_device_alias_get()). */
+   bool alias_fd;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_device_memory, vk.base, VkDeviceMemory,
@@ -56,6 +67,8 @@ hk_device_memory_addr(const struct hk_device_memory *mem)
 {
    return mem->replay_va ? mem->replay_va->addr : mem->bo->va->addr;
 }
+
+void *hk_device_memory_copy_map(struct hk_device_memory *mem);
 
 extern const VkExternalMemoryProperties hk_opaque_fd_mem_props;
 extern const VkExternalMemoryProperties hk_dma_buf_mem_props;

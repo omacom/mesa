@@ -136,7 +136,7 @@ agx_batch_get_g17p_vdm_alias(struct agx_batch *batch, struct agx_bo *bo,
                              uint64_t address)
 {
    struct agx_device *dev = agx_device(batch->ctx->base.screen);
-   if (!agx_native_graphics(dev))
+   if (!agx_chip_native_agx3(dev->chip))
       return address;
 
    if (!bo || address < bo->va->addr || address - bo->va->addr >= bo->size)
@@ -166,7 +166,7 @@ agx_batch_get_g17p_vdm_alias(struct agx_batch *batch, struct agx_bo *bo,
 static void
 agx_encoder_bind_vdm_alias(struct agx_device *dev, struct agx_encoder *encoder)
 {
-   if (!agx_native_graphics(dev))
+   if (!agx_chip_native_agx3(dev->chip))
       return;
 
    encoder->g17p_vdm_alias = agx_bo_get_g17p_vdm_alias(dev, encoder->bo);
@@ -616,6 +616,37 @@ agx_batch_cleanup(struct agx_context *ctx, struct agx_batch *batch, bool reset)
    agx_batch_mark_complete(batch);
 }
 
+/* On a queue that returns from a submission before it retires
+ * (DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT), a batch that fails afterwards
+ * signals its output fence with the error; only the queue's next submission
+ * fails with it. Check the signalled fence before a batch is retired and
+ * the caller reads what it wrote, and report the context as reset if the
+ * batch failed.
+ */
+static void
+agx_check_batch_fence(struct agx_context *ctx, struct agx_batch *batch)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   int fd = -1;
+
+   if (!ctx->async_submit)
+      return;
+   if (drmSyncobjExportSyncFile(dev->fd, batch->syncobj, &fd) || fd < 0)
+      return;
+
+   struct sync_file_info info = {0};
+   int ret = ioctl(fd, SYNC_IOC_FILE_INFO, &info);
+   close(fd);
+   if (ret || info.status >= 0)
+      return;
+
+   agx_msg("batch failed after submission: %s\n", strerror(-info.status));
+   const bool first_fault = !ctx->any_faults;
+   ctx->any_faults = true;
+   if (first_fault && ctx->reset.reset)
+      ctx->reset.reset(ctx->reset.data, PIPE_GUILTY_CONTEXT_RESET);
+}
+
 int
 agx_cleanup_batches(struct agx_context *ctx)
 {
@@ -644,6 +675,7 @@ agx_cleanup_batches(struct agx_context *ctx)
       return -1;
 
    assert(first < AGX_MAX_BATCHES);
+   agx_check_batch_fence(ctx, batches[first]);
    agx_batch_cleanup(ctx, batches[first], false);
    return agx_batch_idx(batches[first]);
 }
@@ -1858,8 +1890,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
     * submission. */
    const bool m5_compute_commands = agx_m5_render_resources(dev) && compute;
    const bool m5_split_prepass =
-      (dev->chip == AGX_CHIP_G17G || dev->chip == AGX_CHIP_G18G) && compute &&
-      !m5_compute_commands;
+      agx_chip_m5_paths(dev->chip) && compute && !m5_compute_commands;
    const unsigned m5_split_count =
       !m5_split_prepass  ? 0
       : render           ? cdm_dispatch_count
@@ -1978,11 +2009,15 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
          const bool g18g = dev->chip == AGX_CHIP_G18G;
          /* Wait through the kernel's normal input-fence path before reading
           * indirect counts, even if the first or every dispatch is empty.
-          * This submission has no output fence and touches no GPU queue. */
+          * This submission has no output fence and touches no GPU queue.
+          * On an async queue, issue it even without input syncs: an earlier
+          * batch of this context may still be writing the counts, and the
+          * kernel returns from a submission without output syncs only once
+          * every earlier submission of the queue has retired. */
          bool has_indirect = false;
          for (unsigned i = 0; g18g && i < cdm_dispatch_count; ++i)
             has_indirect |= cdm_dispatch[i].trace_mode != AGX_CDM_MODE_DIRECT;
-         if (has_indirect && in_sync_count) {
+         if (has_indirect && (in_sync_count || ctx->async_submit)) {
             struct drm_asahi_submit wait = {
                .queue_id = ctx->queue_id,
                .in_sync_count = in_sync_count,
@@ -2321,7 +2356,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
          continue;
 
       /* But any BOs written by active batches are ours */
-      if (unlikely(writer != batch) && (dev->chip == AGX_CHIP_G18G || dev->chip == AGX_CHIP_G17G)) {
+      if (unlikely(writer != batch) && agx_chip_m5_paths(dev->chip)) {
          mesa_loge("asahi: batch %u lists BO %u (%s, %zu bytes @ 0x%" PRIx64
                    ") whose active writer is batch %u",
                    agx_batch_idx(batch), bo->handle,
@@ -2401,6 +2436,7 @@ agx_poll_batch(struct agx_context *ctx, struct agx_batch *batch)
    if (ret)
       return false;
 
+   agx_check_batch_fence(ctx, batch);
    agx_batch_cleanup(ctx, batch, false);
    return true;
 }
@@ -2423,6 +2459,7 @@ agx_sync_batch(struct agx_context *ctx, struct agx_batch *batch)
    assert(batch->syncobj);
    int ret = drmSyncobjWait(dev->fd, &batch->syncobj, 1, INT64_MAX, 0, NULL);
    assert(!ret);
+   agx_check_batch_fence(ctx, batch);
    agx_batch_cleanup(ctx, batch, false);
 }
 
