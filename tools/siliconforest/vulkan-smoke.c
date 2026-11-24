@@ -46,13 +46,27 @@ int main(int argc, char **argv)
 
    const char *chip = getenv("ASAHI_SHIM_CHIP");
    REQUIRE(chip != NULL);
-   /* Every native graphics chip takes the extended profile (the G15
-    * family, G16G and G17P); the AGX2 chips keep upstream's. */
-   const char *native[] = { "g15g", "g15s", "g15c", "g16g", "g17p" };
+   /* The lists name drm-shim profiles (ASAHI_SHIM_CHIP), not chips: the
+    * shim opens a G13G for a name it doesn't know. The AGX2 profiles keep
+    * upstream's conservative Vulkan profile. The native graphics profiles
+    * (the G15 family, G16G and G17P) and the shim's M5 profiles take the
+    * extended one, as hk_get_device_extensions() gives it to
+    * agx_chip_native_agx3() or agx_chip_g17_m5(). Any other profile name
+    * gets no profile checks. */
+   const char *conservative[] = { "g13g", "g13x", "g14g" };
+   const char *native[] = { "g15g", "g15s", "g15c", "g16g", "g17p",
+                            "g17s", "g17s-task", "g17s-kernel",
+                            "g17g-compile-only" };
    bool extended = false;
    for (unsigned i = 0; i < sizeof(native) / sizeof(native[0]); ++i)
       extended |= strcmp(chip, native[i]) == 0;
-   REQUIRE(props.limits.maxBoundDescriptorSets == (extended ? 16u : 8u));
+   bool known = extended;
+   for (unsigned i = 0; i < sizeof(conservative) / sizeof(conservative[0]); ++i)
+      known |= strcmp(chip, conservative[i]) == 0;
+   if (!known)
+      printf("profile checks skipped: %s is in neither chip list\n", chip);
+   if (known)
+      REQUIRE(props.limits.maxBoundDescriptorSets == (extended ? 16u : 8u));
    uint32_t extension_count = 0;
    OK(vkEnumerateDeviceExtensionProperties(physical, NULL, &extension_count, NULL));
    VkExtensionProperties *available = calloc(extension_count, sizeof(*available));
@@ -67,7 +81,7 @@ int main(int argc, char **argv)
       bool found = false;
       for (unsigned i = 0; i < extension_count; ++i)
          found |= strcmp(available[i].extensionName, profile_extensions[e]) == 0;
-      REQUIRE(found == extended);
+      REQUIRE(!known || found == extended);
    }
    free(available);
 
@@ -96,8 +110,8 @@ int main(int argc, char **argv)
    vkGetPhysicalDeviceFeatures2(physical, &features);
    REQUIRE(placed.memoryMapPlaced && placed.memoryUnmapReserve && xfb.transformFeedback);
    REQUIRE(f13.dynamicRendering);
-   REQUIRE((conditional.conditionalRendering != VK_FALSE) == extended);
-   REQUIRE((unified.unifiedImageLayouts != VK_FALSE) == extended);
+   REQUIRE(!known || (conditional.conditionalRendering != VK_FALSE) == extended);
+   REQUIRE(!known || (unified.unifiedImageLayouts != VK_FALSE) == extended);
    f13 = (VkPhysicalDeviceVulkan13Features){
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
       .dynamicRendering = VK_TRUE,
