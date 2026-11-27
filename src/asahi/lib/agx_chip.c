@@ -152,6 +152,28 @@ struct agx_soc {
    bool (*check)(const struct drm_asahi_params_global *params);
 };
 
+/* The G15C contract, for T6031 and T6034 alike: four clusters of ten core
+ * slots on one die. Every consumer reads the fused cores from the supplied
+ * masks, so the check is on the slot layout, not on one revision or core
+ * count. Ten slots is a hardware property the driver depends on: G15 USC code
+ * containers have ten helper-table slots (agx_chip_usc_helper_table_slots()),
+ * and the kernel's G15C command layouts are ten-slot. The kernel is the gate
+ * for which firmware and silicon start at all.
+ */
+static bool
+agx_params_g15c_slots_supported(const struct drm_asahi_params_global *params)
+{
+   if (params->num_cores_per_cluster != 10)
+      return false;
+
+   for (unsigned i = 0; i < 4; ++i) {
+      uint64_t mask = params->core_masks[i];
+      if (!mask || (mask & ~UINT64_C(0x3ff)))
+         return false;
+   }
+   return true;
+}
+
 static const struct agx_soc agx_socs[] = {
    /* T8122 (M3). The firmware interface version does not determine the
     * record layout: both interfaces take G15 records and Gen4 samplers, and
@@ -161,13 +183,18 @@ static const struct agx_soc agx_socs[] = {
    {0x8122, AGX_CHIP_G15G, 1, 1, DRM_ASAHI_GPU_HAL_200, AGX_SOC_NATIVE,
     agx_t8122_hal200_check},
 
-   /* T6030 (M3 Pro) and T6031 (M3 Max), AGX3 shaders on the legacy firmware
-    * interface. Binned parts differ only in their core masks, which every
-    * consumer reads from the parameters, so the masks are not checked. */
+   /* T6030 (M3 Pro), AGX3 shaders on the legacy firmware interface. Binned
+    * parts differ only in their core masks, which every consumer reads from
+    * the parameters, so the masks are not checked. */
    {0x6030, AGX_CHIP_G15S, 1, 2, DRM_ASAHI_GPU_HAL_LEGACY, AGX_SOC_NATIVE,
     NULL},
+
+   /* T6031 and T6034 (M3 Max) share the four-cluster, ten-slot G15C
+    * contract on the legacy firmware interface. */
    {0x6031, AGX_CHIP_G15C, 1, 4, DRM_ASAHI_GPU_HAL_LEGACY, AGX_SOC_NATIVE,
-    NULL},
+    agx_params_g15c_slots_supported},
+   {0x6034, AGX_CHIP_G15C, 1, 4, DRM_ASAHI_GPU_HAL_LEGACY, AGX_SOC_NATIVE,
+    agx_params_g15c_slots_supported},
 
    /* T8132 (M4). */
    {0x8132, AGX_CHIP_G16G, 1, 1, DRM_ASAHI_GPU_HAL_200, AGX_SOC_NATIVE, NULL},
