@@ -5,7 +5,7 @@ series = "7.3"
 [upstream]
 repo = "https://github.com/aurora-silicon/mesa.git"
 ref = "aurora-wip"
-intake = "1fdf5396758fba7dabf6ea987d16a14a74f22d5e"
+intake = "a58f52b53bb1954e4e669236754e318c3eb441c0"
 
 [inputs]
 repo = "https://github.com/omacom/mesa.git"
