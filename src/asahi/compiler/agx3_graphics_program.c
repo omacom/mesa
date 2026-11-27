@@ -239,7 +239,7 @@ agx3_g17p_graphics_external_setup_suffix_generate(
    enum agx_chip chip, const struct agx3_g17p_graphics_program_desc *desc,
    void *output, size_t capacity, size_t *written)
 {
-   if (chip != AGX_CHIP_G17P || !desc || !output || !written ||
+   if (!agx_chip_native_hal200(chip) || !desc || !output || !written ||
        !desc->preloaded_root ||
        (desc->writes_sample_mask && !desc->fragment) ||
        (!desc->fragment && desc->colour_classes) ||
@@ -272,7 +272,7 @@ agx3_g17p_graphics_external_launcher_generate(
    uint64_t program_va, uint64_t root_va, uint64_t setup_va, void *output,
    size_t capacity, size_t *written)
 {
-   if (chip != AGX_CHIP_G17P || !desc || !output || !written ||
+   if (!agx_chip_native_hal200(chip) || !desc || !output || !written ||
        !desc->preloaded_root || !graphics_external_root_uniform_free(desc))
       return false;
 
@@ -343,7 +343,7 @@ agx3_g17p_graphics_external_launcher_template_relocate(
    uint64_t program_va, uint64_t root_va, uint64_t setup_va, void *output,
    size_t capacity, size_t *written)
 {
-   if (chip != AGX_CHIP_G17P || !launcher || !output || !written ||
+   if (!agx_chip_native_hal200(chip) || !launcher || !output || !written ||
        launcher->length > sizeof(launcher->bytes) ||
        launcher->length > capacity ||
        launcher->branch_offset + AGX_IOTO_PRESHADER_BRANCH_SIZE !=
@@ -694,8 +694,47 @@ graphics_program_shape_equal(
    const struct agx3_cprog_inputs *ai = a->cprog_inputs ? a->cprog_inputs : &empty;
    const struct agx3_cprog_inputs *bi = b->cprog_inputs ? b->cprog_inputs : &empty;
    if (ai->count != bi->count || ai->storage_bytes != bi->storage_bytes ||
-       memcmp(ai->halves, bi->halves, sizeof(ai->halves)))
+       (ai->count && memcmp(ai->halves, bi->halves, sizeof(ai->halves))))
       return false;
+
+   if (!a->uniform_range_count)
+      return true;
+
+   /* Common case: every range translates by the exact same non-wrapping delta
+    * (e.g. a batch pool moving forward between draws). Translation preserves
+    * the sorted order, address-cache component partition, and all pairwise
+    * distances, so skip both component builds. */
+   uint64_t end0_a, end0_b;
+   if (a->uniform_ranges[0].start_halfs != b->uniform_ranges[0].start_halfs ||
+       a->uniform_ranges[0].size_halfs != b->uniform_ranges[0].size_halfs ||
+       !graphics_range_end(&a->uniform_ranges[0], &end0_a) ||
+       !graphics_range_end(&b->uniform_ranges[0], &end0_b))
+      return false;
+
+   const bool forward = b->uniform_ranges[0].address >= a->uniform_ranges[0].address;
+   const uint64_t shift = forward
+      ? b->uniform_ranges[0].address - a->uniform_ranges[0].address
+      : a->uniform_ranges[0].address - b->uniform_ranges[0].address;
+   bool uniform_shift = true;
+   for (unsigned i = 1; i < a->uniform_range_count; ++i) {
+      uint64_t ea, eb;
+      if (a->uniform_ranges[i].start_halfs != b->uniform_ranges[i].start_halfs ||
+          a->uniform_ranges[i].size_halfs != b->uniform_ranges[i].size_halfs)
+         return false;
+      if (uniform_shift) {
+         if (!graphics_range_end(&a->uniform_ranges[i], &ea) ||
+             !graphics_range_end(&b->uniform_ranges[i], &eb))
+            return false;
+         const bool dir = b->uniform_ranges[i].address >= a->uniform_ranges[i].address;
+         const uint64_t d = dir
+            ? b->uniform_ranges[i].address - a->uniform_ranges[i].address
+            : a->uniform_ranges[i].address - b->uniform_ranges[i].address;
+         if (dir != forward || d != shift)
+            uniform_shift = false;
+      }
+   }
+   if (uniform_shift)
+      return true;
 
    unsigned ap[AGX3_G17P_GRAPHICS_MAX_RANGES];
    unsigned bp[AGX3_G17P_GRAPHICS_MAX_RANGES];
@@ -711,12 +750,6 @@ graphics_program_shape_equal(
       ab[i] = ba[i] = AGX3_G17P_GRAPHICS_MAX_RANGES;
 
    for (unsigned i = 0; i < a->uniform_range_count; ++i) {
-      if (a->uniform_ranges[i].start_halfs !=
-             b->uniform_ranges[i].start_halfs ||
-          a->uniform_ranges[i].size_halfs !=
-             b->uniform_ranges[i].size_halfs)
-         return false;
-
       /* Require the same partition in both directions. Within a component
        * every range must move by the same amount: comparing to one anchor
        * establishes all pairwise offsets without a quadratic second walk. */
@@ -735,6 +768,28 @@ graphics_program_shape_equal(
    return true;
 }
 
+static inline bool
+graphics_pack_ldimm_encoded(enum agx_ioto_load_encoding encoding,
+                            uint16_t dest_half, uint32_t immediate,
+                            uint8_t out[AGX_IOTO_LOAD_LDIMM_MAX_SIZE],
+                            uint8_t *length)
+{
+   if ((dest_half & 1) != 0 || dest_half >= 256)
+      return false;
+
+   if (dest_half < 32 && immediate < 128) {
+      out[0] = (uint8_t)((encoding == AGX_IOTO_LOAD_ENCODING_GPU0 ? 0x0c : 0x04) |
+                         ((dest_half >> 1) << 4));
+      out[1] = (uint8_t)immediate;
+      *length = 2;
+      return true;
+   }
+
+   agx_ioto_load_pack_ldimm_long(dest_half, immediate, out);
+   *length = 8;
+   return true;
+}
+
 bool
 agx3_g17p_graphics_program_template_relocate(
    enum agx_chip chip,
@@ -749,6 +804,11 @@ agx3_g17p_graphics_program_template_relocate(
        program->program.length > capacity ||
        program->relocation_count > ARRAY_SIZE(program->relocations) ||
        !graphics_program_shape_equal(template_desc, target_desc))
+      return false;
+
+   const enum agx_ioto_load_encoding encoding =
+      agx_ioto_load_target_encoding(chip);
+   if (encoding == AGX_IOTO_LOAD_ENCODING_UNSUPPORTED)
       return false;
 
    uint8_t staged[AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE];
@@ -779,25 +839,20 @@ agx3_g17p_graphics_program_template_relocate(
       const uint64_t target =
          target_desc->uniform_ranges[range].address + delta;
 
+      const uint32_t old_lo_val = (uint32_t)rel->address;
+      const uint32_t old_hi_val = (uint32_t)(rel->address >> 32);
+      const uint32_t new_lo_val = (uint32_t)target;
+      const uint32_t new_hi_val = (uint32_t)(target >> 32);
+
       uint8_t old_low[AGX_IOTO_LOAD_LDIMM_MAX_SIZE];
       uint8_t old_high[AGX_IOTO_LOAD_LDIMM_MAX_SIZE];
-      uint8_t new_low[AGX_IOTO_LOAD_LDIMM_MAX_SIZE];
-      uint8_t new_high[AGX_IOTO_LOAD_LDIMM_MAX_SIZE];
-      uint8_t old_low_len, old_high_len, new_low_len, new_high_len;
-      if (!agx_ioto_load_pack_ldimm(chip, rel->dest_half,
-                                    (uint32_t)rel->address, old_low,
-                                    &old_low_len) ||
-          !agx_ioto_load_pack_ldimm(chip, rel->dest_half + 2,
-                                    (uint32_t)(rel->address >> 32), old_high,
-                                    &old_high_len) ||
-          !agx_ioto_load_pack_ldimm(chip, rel->dest_half, (uint32_t)target,
-                                    new_low, &new_low_len) ||
-          !agx_ioto_load_pack_ldimm(chip, rel->dest_half + 2,
-                                    (uint32_t)(target >> 32), new_high,
-                                    &new_high_len) ||
+      uint8_t old_low_len, old_high_len;
+      if (!graphics_pack_ldimm_encoded(encoding, rel->dest_half, old_lo_val,
+                                       old_low, &old_low_len) ||
+          !graphics_pack_ldimm_encoded(encoding, rel->dest_half + 2, old_hi_val,
+                                       old_high, &old_high_len) ||
           old_low_len != rel->low_length ||
           old_high_len != rel->high_length ||
-          new_low_len != old_low_len || new_high_len != old_high_len ||
           rel->offset > program->program.length ||
           old_low_len + old_high_len > program->program.length - rel->offset ||
           memcmp(program->program.bytes + rel->offset, old_low,
@@ -806,8 +861,26 @@ agx3_g17p_graphics_program_template_relocate(
                  old_high, old_high_len))
          return false;
 
-      memcpy(staged + rel->offset, new_low, new_low_len);
-      memcpy(staged + rel->offset + new_low_len, new_high, new_high_len);
+      if (new_lo_val != old_lo_val) {
+         uint8_t new_low[AGX_IOTO_LOAD_LDIMM_MAX_SIZE];
+         uint8_t new_low_len;
+         if (!graphics_pack_ldimm_encoded(encoding, rel->dest_half, new_lo_val,
+                                          new_low, &new_low_len) ||
+             new_low_len != old_low_len)
+            return false;
+         memcpy(staged + rel->offset, new_low, new_low_len);
+      }
+
+      if (new_hi_val != old_hi_val) {
+         uint8_t new_high[AGX_IOTO_LOAD_LDIMM_MAX_SIZE];
+         uint8_t new_high_len;
+         if (!graphics_pack_ldimm_encoded(encoding, rel->dest_half + 2,
+                                          new_hi_val, new_high,
+                                          &new_high_len) ||
+             new_high_len != old_high_len)
+            return false;
+         memcpy(staged + rel->offset + old_low_len, new_high, new_high_len);
+      }
    }
 
    if (template_desc->constant_program.code_size) {
@@ -872,15 +945,9 @@ g18g_graphics_program_generate(
          (desc->threadgroup_memory_size_B & 63))) ||
        desc->colour_classes > 7 ||
        (!desc->fragment && desc->colour_classes) ||
-       /* A render with no colour attachment has an empty imageblock. Apple's
-        * own colour-free render emits the same fragment SPECLM spelling as a
-        * colour one -- both carry 1700002c00001808 -- so the sample size may
-        * be zero as well as the witnessed eight bytes. Other tile sizes and
-        * sample counts still need their own native evidence.
-        *
-        * msaa163: plus exactly one multisample imageblock, eight-byte samples
-        * at 4x in a 32x16 tile -- what Apple's M5 and G18 4x renders select
-        * for one RGBA8 target (MSAA notes s2.4). */
+       /* Admitted imageblock shapes: 32x32 1x with 0 (depth-only) or 8-byte
+        * samples, plus 32x16 4x MSAA with 8-byte samples. Other tile sizes
+        * and sample counts stay closed. */
        (desc->fragment &&
         !((desc->imageblock.sample_size_B == 8 ||
            (target_chip == AGX_CHIP_G18G &&
@@ -918,16 +985,9 @@ g18g_graphics_program_generate(
                                           desc->uniform_range_count, &bound))
       return false;
 
-   /* The captured M5 physical imageblock spelling. Byte 7 is the imageblock
-    * sample size in bytes: three native fragment renders taken in one session
-    * publish 1700002c00001808 for one RGBA8 attachment and 1700002c00001820
-    * for eight, and nothing else in the record moves. Bytes 0..6 -- which are
-    * the per-tile-shape seed in HAL200's spelling -- are identical across
-    * both, so Apple keeps the 32x32 tile for 32-byte samples rather than
-    * halving it, landing on exactly the 32 KiB structural bound. The byte is
-    * therefore a plain byte count, and sixteen-byte samples (RGBA32 and RGB32
-    * attachments) use it as such. Other tile sizes and sample counts still
-    * need their own native evidence. */
+   /* M5 physical imageblock record: bytes 0..6 encode the tile shape (32x32
+    * up to the 32 KiB bound) and byte 7 is the per-sample byte count (0, 8,
+    * 16, or 32 bytes). Other tile sizes and sample counts stay closed. */
    static const uint8_t speclm[2][AGX_IOTO_SPECLM_SIZE] = {
       {0x07,0x00,0x00,0x0c,0x00,0x00,0x00,0x00},
       {0x17,0x00,0x00,0x2c,0x00,0x00,0x18,0x08},
@@ -1089,7 +1149,7 @@ agx3_g17p_graphics_program_desc_bound(
    size_t *size)
 {
    size_t base, input_body, chunks;
-   if (!desc || !size || chip != AGX_CHIP_G17P ||
+   if (!desc || !size || !agx_chip_native_hal200(chip) ||
        desc->uniform_range_count > AGX3_G17P_GRAPHICS_MAX_RANGES ||
        (desc->uniform_range_count && !desc->uniform_ranges) ||
        (desc->constant_program.code_size & 1) ||
@@ -1146,7 +1206,7 @@ agx3_g17p_graphics_root_prefix_generate(
    enum agx_chip chip, uint64_t root_va,
    struct agx3_g17p_graphics_root_prefix *prefix)
 {
-   if (!prefix || chip != AGX_CHIP_G17P || !root_va)
+   if (!prefix || !agx_chip_native_hal200(chip) || !root_va)
       return false;
 
    struct agx3_g17p_graphics_root_prefix staged = {0};

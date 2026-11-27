@@ -82,6 +82,13 @@ hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd, const void *from,
    assert(!"no alias sites are recorded");
 }
 
+void
+hk_cmd_buffer_move_sparse_sites(struct hk_cmd_buffer *cmd, const void *from,
+                                const void *from_end, uint8_t *to, size_t skip)
+{
+   assert(!"no sparse sites are recorded");
+}
+
 /* As the driver's: move to a new chunk through a link when the space does
  * not fit. */
 void
@@ -517,6 +524,13 @@ hk_reserve_scratch_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
 void
 hk_sync_check_cs(struct hk_cmd_buffer *cmd)
+{
+   (void)cmd;
+   abort();
+}
+
+void
+hk_sync_flush_lead_timestamp(struct hk_cmd_buffer *cmd)
 {
    (void)cmd;
    abort();

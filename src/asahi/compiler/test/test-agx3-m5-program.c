@@ -10,6 +10,9 @@
 #include "asahi/lib/agx_ioto_preshader_core.h"
 #include "asahi/lib/agx_ppp_hal300_graphics_core.h"
 #include "asahi/lib/agx3_compute_program_core.h"
+#include "asahi/lib/agx3_code_container_core.h"
+#include "asahi/lib/agx_bytes.h"
+#include "asahi/lib/agx_ioto_load_core.h"
 #include "util/macros.h"
 
 #include <stdio.h>
@@ -23,6 +26,35 @@
          return 1;                                                             \
       }                                                                        \
    } while (0)
+
+/* The cluster count each M5 part's kernel reports (its contract in
+ * agx_params_m5_supported()), which the USC window's lead is built for. */
+static unsigned
+m5_clusters(enum agx_chip chip)
+{
+   switch (chip) {
+   case AGX_CHIP_G17S: return 2;
+   case AGX_CHIP_G17C: return 4;
+   case AGX_CHIP_G17D: return 8;
+   default: return 1;
+   }
+}
+
+/* Whether the profile loader at `loader` loads the offset of the lead's
+ * helper-table group for this cluster count, through the LDIMM's immediate.
+ * For one and two clusters that is the template's raw byte at +20 as well
+ * (4, 8 and 16 for 0x100, 0x200 and 0x400). */
+static bool
+loader_points_at_group(const uint8_t *loader, unsigned clusters, bool vertex)
+{
+   const uint32_t group = agx3_m5_container_group_offset(clusters, vertex);
+   const uint64_t field = agx_ioto_load_ldimm_long_immediate(UINT32_MAX);
+
+   return group &&
+          (agx_load_le64(loader + 16) & field) ==
+             agx_ioto_load_ldimm_long_immediate(group) &&
+          (clusters > 2 || loader[20] == group >> 6);
+}
 
 static int
 test_g17g_programs(enum agx_chip chip)
@@ -47,6 +79,7 @@ test_g17g_programs(enum agx_chip chip)
          .compiler_d = fragment ? 0 : 32,
          .fragment = fragment,
          .imageblock = { .sample_size_B = 8, .nr_samples = 1, .tile_size_px = 1024 },
+         .usc_clusters = m5_clusters(chip),
       };
       struct agx3_g17p_graphics_program output;
       size_t empty_bound;
@@ -57,8 +90,15 @@ test_g17g_programs(enum agx_chip chip)
                                                  &output));
       CHECK(output.length == (fragment ? 90 : 84));
       CHECK(memcmp(output.bytes, expected_tail[fragment], 28) == 0);
-      CHECK(output.bytes[48] == (fragment ? 4 : 8) *
-            ((chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C) ? 2 : 1));
+      CHECK(loader_points_at_group(output.bytes + 28, m5_clusters(chip),
+                                   !fragment));
+      {
+         /* Without the cluster count the program is refused. */
+         struct agx3_g17p_graphics_program_desc no_clusters = desc;
+         no_clusters.usc_clusters = 0;
+         CHECK(!agx3_g17g_graphics_program_generate(chip, &no_clusters,
+                                                    &output));
+      }
 
 
       {
@@ -78,10 +118,10 @@ test_g17g_programs(enum agx_chip chip)
             CHECK(memcmp(wide_output.bytes + 18, expected_spectpr[i], 10) == 0);
          }
       }
-      const uint32_t scratch_bytes[] = {4, 272, 400, 528, 1040, 262140};
+      const uint32_t scratch_bytes[] = {4, 272, 400, 528, 1040, 8192, 262140};
       const uint8_t scratch_fields[][4] = {
          {1, 0, 1, 0}, {68, 0, 68, 0}, {100, 0, 100, 0},
-         {132, 0, 132, 0}, {4, 1, 4, 1}, {255, 255, 255, 255},
+         {132, 0, 132, 0}, {4, 1, 4, 1}, {0, 8, 0, 8}, {255, 255, 255, 255},
       };
       for (unsigned i = 0; i < ARRAY_SIZE(scratch_bytes); ++i) {
          struct agx3_g17p_graphics_program_desc spill = desc;
@@ -227,8 +267,8 @@ test_g17g_programs(enum agx_chip chip)
          CHECK(output.length == 84);
          CHECK(!memcmp(output.bytes, expected_tail[0], 8));
          CHECK(!memcmp(output.bytes + 8, expected_tail[1] + 8, 20));
-         CHECK(output.bytes[28 + 20] ==
-               ((chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C) ? 8 : 4));
+         CHECK(loader_points_at_group(output.bytes + 28, m5_clusters(chip),
+                                      false));
          static const uint8_t end[] = {14, 0, 0, 0};
          CHECK(!memcmp(output.bytes + 80, end, sizeof(end)));
 
@@ -285,21 +325,31 @@ test_g17g_programs(enum agx_chip chip)
 static int
 test_m5_dispatch(enum agx_chip chip)
 {
+   /* A device of two dies scopes every ordering record
+    * (agx_cdm_ordering_memory_scope()); the M5 Ultra is the M5 part that has
+    * two, and the scoped record is grounded on it alone. */
+   const bool scoped = chip == AGX_CHIP_G17D;
    struct agx3_g17p_native_compute_program_desc desc = {
       .program_va = UINT64_C(0x10000090000),
       .shader_va = UINT64_C(0x100000003c0),
+      .ordering_memory_scope = true,
    };
    CHECK(agx3_cdm_direct_template_sources_compute(false, false, false,
                                                   &desc.launch_sources));
    struct agx3_compute_program program;
+   /* Refused where the scoped ordering record is not grounded. */
+   CHECK(agx3_m5_native_compute_program_bind(chip, &desc, &program) ==
+         scoped);
+   desc.ordering_memory_scope = scoped;
    CHECK(agx3_m5_native_compute_program_bind(chip, &desc, &program));
+   const uint32_t tail = scoped ? 0x6000017c : 0x60000160;
    struct agx3_compute_direct_grid grid = {
       .source = AGX3_CDM_DIRECT_GRID_GLOBAL_THREADS,
       .size = {1024,1,1}, .local_size = {64,1,1}, .dimensions = 1,
    };
    const uint32_t expected[] = {
       0, 0x01000000, 0x2400, 0x40000001,
-      1024, 1, 1, 64, 1, 1, 0x60000160,
+      1024, 1, 1, 64, 1, 1, tail,
    };
    uint8_t out[sizeof(expected)];
    struct agx3_compute_dispatch_sink sink = {.data = out, .capacity = sizeof(out)};
@@ -323,7 +373,7 @@ test_m5_dispatch(enum agx_chip chip)
    CHECK(!memcmp(saved, out, sizeof(out)));
    const uint32_t indirect_local[] = {
       0x10080000, 0x01000000, 0x2400, 0x40000001,
-      0x23, 0x45678000, 0x60000160,
+      0x23, 0x45678000, tail,
    };
    sink.length = 0;
    CHECK(agx3_m5_native_indirect_dispatch_append(
@@ -337,18 +387,18 @@ test_m5_dispatch(enum agx_chip chip)
  * it writes into the single-kick slot from a kernel's template. */
 static void
 select_launch_model(const uint32_t tmpl[11], bool run, uint32_t groups_x,
-                    uint32_t height, uint32_t depth, unsigned log2,
+                    uint32_t groups_y, uint32_t depth, unsigned log2,
                     uint32_t out[11])
 {
    uint32_t word0 = tmpl[0];
-   if (!run || (height < 2 && depth < 2))
+   if (!run || (groups_y < 2 && depth < 2))
       word0 &= 0xfff1ffffu;
    out[0] = word0;
    out[1] = tmpl[1];
    out[2] = tmpl[2];
    out[3] = tmpl[3];
    out[4] = run ? groups_x << log2 : 0;
-   out[5] = run ? height : 0;
+   out[5] = run ? groups_y : 0;
    out[6] = run ? depth : 0;
    out[7] = run ? tmpl[7] : 0;
    out[8] = run ? tmpl[8] : 0;
@@ -384,20 +434,36 @@ test_m5_single_kick_launch(enum agx_chip chip)
       CHECK(sink.length == sizeof(tmpl));
 
       const uint32_t dims[][3] = {
-         {1, 1, 1}, {31, 1, 1}, {32, 1, 1}, {33, 1, 1}, {1920, 1080, 1},
-         {64, 1, 7}, {5, 3, 2}, {2976, 1872, 1},
+         {1, 1, 1}, {31, 1, 1}, {32, 1, 1}, {33, 1, 1}, {64, 1, 7},
+         /* Partial edge tiles at heights 2, 4, and 5: heights 2 and 4 collapse
+          * into a single 8x4 tile row (groups_y == 1, clearing the 2D/3D bits
+          * for depth == 1), while height 5 crosses into a second tile row
+          * (groups_y == 2, keeping the 2D encoding). */
+         {1, 2, 1}, {7, 2, 1}, {8, 2, 1}, {9, 2, 1}, {9, 2, 2},
+         {1, 4, 1}, {7, 4, 1}, {8, 4, 1}, {9, 4, 1}, {9, 4, 2},
+         {1, 5, 1}, {7, 5, 1}, {8, 5, 1}, {9, 5, 1}, {9, 5, 2},
+         {5, 3, 1}, {5, 3, 2}, {1920, 1080, 1}, {2976, 1872, 1},
       };
       for (unsigned i = 0; i < ARRAY_SIZE(dims); ++i) {
          const uint32_t w = dims[i][0], h = dims[i][1], d = dims[i][2];
-         const uint32_t groups_x = (w >> 5) + ((w & 31) ? 1 : 0);
+         const uint32_t groups_x = h > 1 ? ((w >> 3) + ((w & 7) ? 1 : 0))
+                                         : ((w >> 5) + ((w & 31) ? 1 : 0));
+         const uint32_t groups_y = h > 1 ? ((h >> 2) + ((h & 3) ? 1 : 0)) : h;
          uint32_t model[11];
-         select_launch_model(tmpl, true, groups_x, h, d, 5, model);
+         select_launch_model(tmpl, true, groups_x, groups_y, d, 5, model);
+         if (groups_y == 1 && d == 1)
+            CHECK((model[0] & 0x000e0000u) == 0);
+         else
+            CHECK((model[0] & 0x000e0000u) != 0);
+         CHECK(model[4] == (groups_x << 5));
+         CHECK(model[5] == groups_y);
+         CHECK(model[6] == d);
 
          /* hk_dispatch_m5_native's direct record for the same launch. */
          const struct agx3_compute_direct_grid grid = {
             .source = AGX3_CDM_DIRECT_GRID_GLOBAL_THREADS,
-            .size = {groups_x * 32, h, d}, .local_size = {32, 1, 1},
-            .dimensions = d != 1 ? 3 : h != 1 ? 2 : 1,
+            .size = {groups_x * 32, groups_y, d}, .local_size = {32, 1, 1},
+            .dimensions = d != 1 ? 3 : groups_y != 1 ? 2 : 1,
          };
          uint32_t host[11];
          sink = (struct agx3_compute_dispatch_sink){
@@ -530,6 +596,7 @@ test_multiround_uniforms(enum agx_chip chip)
       { .start_halfs = 8, .size_halfs = 180, .address = 0x5000010000 },
    };
    struct agx3_g17p_graphics_program_desc desc = {
+      .usc_clusters = m5_clusters(chip),
       .program_va = 0x10000100000, .shader_va = 0x10000000480,
       .shader_binary_size = 128, .nr_gprs = 16,
       .compiler_d_valid = true, .uniform_ranges = ranges,
@@ -753,19 +820,25 @@ int main(void) {
    int r = test_unused_vertex_outputs() || test_flat_shading_vertex() || test_load_completion_wait(AGX_CHIP_G17G) ||
            test_load_completion_wait(AGX_CHIP_G17S) ||
            test_load_completion_wait(AGX_CHIP_G17C) ||
+           test_load_completion_wait(AGX_CHIP_G17D) ||
            test_multiround_uniforms(AGX_CHIP_G17G) ||
            test_multiround_uniforms(AGX_CHIP_G17S) ||
            test_multiround_uniforms(AGX_CHIP_G17C) ||
+           test_multiround_uniforms(AGX_CHIP_G17D) ||
            test_cprog_input_bound(AGX_CHIP_G17G) ||
            test_cprog_input_bound(AGX_CHIP_G17S) ||
            test_cprog_input_bound(AGX_CHIP_G17C) ||
+           test_cprog_input_bound(AGX_CHIP_G17D) ||
            test_color_disabled() || test_visibility() || test_line_width() || test_polygon_and_primitive_msaa() || test_g17g_programs(AGX_CHIP_G17G) || test_g17g_programs(AGX_CHIP_G17S) ||
            test_g17g_programs(AGX_CHIP_G17C) ||
+           test_g17g_programs(AGX_CHIP_G17D) ||
            test_m5_dispatch(AGX_CHIP_G17G) || test_m5_dispatch(AGX_CHIP_G17S) ||
            test_m5_dispatch(AGX_CHIP_G17C) ||
+           test_m5_dispatch(AGX_CHIP_G17D) ||
            test_m5_single_kick_launch(AGX_CHIP_G17G) ||
            test_m5_single_kick_launch(AGX_CHIP_G17S) ||
-           test_m5_single_kick_launch(AGX_CHIP_G17C);
+           test_m5_single_kick_launch(AGX_CHIP_G17C) ||
+           test_m5_single_kick_launch(AGX_CHIP_G17D);
    if (!r) puts("M5_PROGRAM_DISPATCH_PASS");
    return r;
 }

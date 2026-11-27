@@ -23,6 +23,7 @@
 
 #include "agx_bo.h"
 #include "agx_chip.h"
+#include "agx_drm_names.h"
 #include "agx_pack.h"
 #include "decode.h"
 #include "layout.h"
@@ -35,20 +36,6 @@
 struct vdrm_device;
 struct asahi_ccmd_submit_res;
 #endif
-
-/* DRM name of the native kernel driver. Kernels before the Aurora rename
- * report "asahi", so both are accepted and Mesa and the kernel can update in
- * either order.
- */
-#define AGX_DRM_DRIVER_NAME        "aurora"
-#define AGX_DRM_DRIVER_NAME_LEGACY "asahi"
-
-static inline bool
-agx_is_native_drm_driver(const char *name)
-{
-   return name && (!strcmp(name, AGX_DRM_DRIVER_NAME) ||
-                   !strcmp(name, AGX_DRM_DRIVER_NAME_LEGACY));
-}
 
 enum agx_dbg {
    AGX_DBG_TRACE = BITFIELD_BIT(0),
@@ -85,15 +72,19 @@ enum agx_dbg {
 };
 
 /* How many power-of-two levels in the BO cache do we want? 2^14 minimum chosen
- * as it is the page size that all allocations are rounded to
+ * as it is the page size that all allocations are rounded to, up to 2^28
+ * (256 MiB, matching AGX_BO_CACHE_MAX_SIZE) so large allocations do not collide
+ * in a single bucket.
  */
 #define MIN_BO_CACHE_BUCKET (14) /* 2^14 = 16KB */
-#define MAX_BO_CACHE_BUCKET (22) /* 2^22 = 4MB */
+#define MAX_BO_CACHE_BUCKET (28) /* 2^28 = 256MB */
 
 /* Fencepost problem, hence the off-by-one */
+#define NR_BO_CACHE_SIZE_BUCKETS \
+   (MAX_BO_CACHE_BUCKET - MIN_BO_CACHE_BUCKET + 1)
 #define NR_BO_CACHE_FLAG_BUCKETS 16
 #define NR_BO_CACHE_BUCKETS \
-   ((MAX_BO_CACHE_BUCKET - MIN_BO_CACHE_BUCKET + 1) * NR_BO_CACHE_FLAG_BUCKETS)
+   (NR_BO_CACHE_SIZE_BUCKETS * NR_BO_CACHE_FLAG_BUCKETS)
 
 /* Forward decl only, do not pull in all of NIR */
 struct nir_shader;
@@ -182,6 +173,9 @@ struct agx_device {
     * client_memory_limit tail of drm_asahi_params_global (where 0 means no
     * driver limit, as opposed to a legacy 600-byte reply or virtio). */
    bool has_memory_limits;
+   /* GEM_USERPTR imports ranges of any size the GPU memory limits admit in
+    * this process (agx_userptr_imports_any_size()), checked at open. */
+   bool userptr_any_size;
    agx_device_ops_t ops;
 
    /* vdrm device */
@@ -263,7 +257,8 @@ struct agx_device {
 
       /* Power-of-two size classes, subdivided by allocation-flag hash.
        * Exact flags are still checked when fetching; collisions only affect
-       * lookup cost. Each bucket is a list of free agx_bo objects.
+       * lookup cost. Each bucket is a LIFO list of free agx_bo objects so
+       * recently freed, non-purgeable BOs are reused first.
        */
       struct list_head buckets[NR_BO_CACHE_BUCKETS];
 
@@ -282,7 +277,9 @@ struct agx_device {
       int madvise;
 
       /* DRM shmem pages remain pinned while a BO is cached. Wake only while
-       * the cache has entries, so an idle client can release stale BOs. */
+       * the cache has entries, so an idle client can release stale BOs.
+       * idle_pending is written atomically under idle_lock and read atomically
+       * under bo_cache.lock to skip idle_lock on active-cache puts. */
       mtx_t idle_lock;
       struct u_cnd_monotonic idle_cond;
       thrd_t idle_thread;
@@ -426,11 +423,21 @@ agx_bo_map_placed(struct agx_bo *bo, void *fixed_addr, size_t length)
       }
 
       if (bo->dev->ops.bo_mmap_independent) {
-         struct agx_bo copy = *bo;
-         copy._map = NULL;
-         copy._map_size = 0;
+         struct agx_bo copy = {
+            .dev = bo->dev,
+            .flags = bo->flags,
+            .size = bo->size,
+            .handle = bo->handle,
+            .uapi_handle = bo->uapi_handle,
+            .has_mmap_offset = bo->has_mmap_offset,
+            .mmap_offset = bo->mmap_offset,
+         };
          bo->dev->ops.bo_mmap(bo->dev, &copy, fixed_addr,
                               fixed_addr ? length : 0);
+         if (!bo->has_mmap_offset && copy.has_mmap_offset) {
+            bo->mmap_offset = copy.mmap_offset;
+            p_atomic_set(&bo->has_mmap_offset, true);
+         }
          map = copy._map;
          bo->_map_size = copy._map_size;
          p_atomic_set(&bo->_map, map);
@@ -466,10 +473,26 @@ agx_bo_map_owned(struct agx_bo *bo, void *fixed_addr, size_t length,
    if (!bo->dev->ops.bo_mmap_independent || (bo->flags & AGX_BO_HOST_PTR))
       return NULL;
 
-   struct agx_bo copy = *bo;
-   copy._map = NULL;
-   copy._map_size = 0;
+   struct agx_bo copy = {
+      .dev = bo->dev,
+      .flags = bo->flags,
+      .size = bo->size,
+      .handle = bo->handle,
+      .uapi_handle = bo->uapi_handle,
+   };
+   if (p_atomic_read(&bo->has_mmap_offset)) {
+      copy.has_mmap_offset = true;
+      copy.mmap_offset = bo->mmap_offset;
+   }
    bo->dev->ops.bo_mmap(bo->dev, &copy, fixed_addr, fixed_addr ? length : 0);
+   if (copy.has_mmap_offset && !p_atomic_read(&bo->has_mmap_offset)) {
+      simple_mtx_lock(&bo->dev->bo_mmap_lock);
+      if (!bo->has_mmap_offset) {
+         bo->mmap_offset = copy.mmap_offset;
+         p_atomic_set(&bo->has_mmap_offset, true);
+      }
+      simple_mtx_unlock(&bo->dev->bo_mmap_lock);
+   }
    *size = agx_bo_map_size(&copy);
    return copy._map;
 }
@@ -491,6 +514,25 @@ agx_has_userptr(const struct agx_device *dev)
           (dev->params.features & DRM_ASAHI_FEATURE_USERPTR);
 }
 
+/*
+ * Host memory imports of any size can succeed: GEM_USERPTR is available and
+ * the caller's RLIMIT_MEMLOCK does not bound it below the GPU memory limits.
+ * APIs whose imports have no size bound of their own offer them only then.
+ */
+static inline bool
+agx_has_host_import(const struct agx_device *dev)
+{
+   return agx_has_userptr(dev) && dev->userptr_any_size;
+}
+
+/* The kernel charges GEM_USERPTR pins to RLIMIT_MEMLOCK as well as to the GPU
+ * memory limits (agx_userptr_limits.h). */
+static inline bool
+agx_userptr_charges_memlock(const struct agx_device *dev)
+{
+   return !(dev->params.features & DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK);
+}
+
 /* The kernel can keep a BO resident under memory pressure (GEM_RESIDENCY). */
 static inline bool
 agx_has_residency_control(const struct agx_device *dev)
@@ -504,6 +546,31 @@ agx_has_soft_fault(const struct agx_device *dev)
 {
    return (dev->params.features & DRM_ASAHI_FEATURE_SOFT_FAULTS) &&
           !(dev->debug & AGX_DBG_NOSOFT);
+}
+
+/*
+ * Whether every M5 compute barrier takes memory scope: every launch's ordering
+ * record (0x6000017c) and every flush recorded for a dependency, whatever
+ * memory the device can alias (hk_cdm_alias_scope()). Selected by what the
+ * kernel reports, a GPU of more than one die, as agx_gather_device_key()
+ * already selects multi-die coherency, and only where the scoped ordering
+ * record is grounded for the chip.
+ *
+ * On the M5 Ultra (two dies, J775D), with plain barriers wherever no memory
+ * aliases, 6 cases of a 117-case compute CTS subset, 2059 to 2160 of 8520
+ * ycbcr cases (a different set from run to run) and 270 of 5310
+ * host_image_copy cases failed, and llama.cpp's output was wrong; with memory
+ * scope on every barrier all of them pass. Why it needs the scope is not
+ * established: the die count is the property that separates it from the M5
+ * parts that have not shown the failure, not a measured cause. An M5 Pro or
+ * M5 Max run of those six cases under plain barriers would say whether the
+ * line is the dies or the M5 family.
+ */
+static inline bool
+agx_cdm_ordering_memory_scope(const struct agx_device *dev)
+{
+   return dev->params.num_dies > 1 && agx_chip_g17_m5(dev->chip) &&
+          agx_chip_has_record(dev->chip, AGX_RECORD_CDM_ORDERING_FLUSH_MEMORY);
 }
 
 /* Base of the G17P USC exec window.  MEASURED RULE: bit 40 of the program VA
@@ -616,16 +683,6 @@ agx_stream_sampler_state(const struct agx_device *dev)
           dev->params.gpu_hal_generation == DRM_ASAHI_GPU_HAL_200;
 }
 
-/* T6040 uses the G17P architecture profile, while capability rollout may
- * still be product-specific. Device admission has already checked USC/HAL. */
-static inline bool
-agx_is_m4_pro(const struct agx_device *dev)
-{
-   return dev->chip == AGX_CHIP_G17P &&
-          dev->params.chip_id == AGX_CHIP_ID_M4_PRO &&
-          dev->params.gpu_generation == 16 && dev->params.gpu_variant == 'S';
-}
-
 struct agx_va *agx_va_alloc(struct agx_device *dev, uint64_t size_B,
                             uint64_t align_B, enum agx_va_flags flags,
                             uint64_t fixed_va);
@@ -641,6 +698,40 @@ agx_cmd_header(bool compute, uint16_t barrier_vdm, uint16_t barrier_cdm)
       .vdm_barrier = barrier_vdm,
       .cdm_barrier = barrier_cdm,
    };
+}
+
+/* Sibling kernel queues for one context's compute work. Firmware runs the
+ * compute kicks of one context's kernel queues at the same time, so
+ * independent compute submissions spread over several of them overlap
+ * instead of running back to back. Borealis measured three queues as the
+ * best split, and a gain only with at least two earlier submissions still in
+ * flight: with one, both kicks run at half speed and finish together
+ * (hk_queue.c). Overlap pays where one dispatch cannot fill the GPU's memory
+ * pipeline and costs where two compete for the same execution units: on the
+ * A18 Pro a stream of 4M-thread copy dispatches went 42 % faster, 262144-
+ * thread FMA dispatches broke even (+0.3 %) and 65536-thread divergent ones
+ * lost 4.6 %, so dispatches below 262144 threads stay on one queue.
+ */
+#define AGX_SIBLING_COMPUTE_QUEUES      3
+#define AGX_SIBLING_COMPUTE_MIN_IN_FLIGHT 2
+#define AGX_SIBLING_COMPUTE_MIN_THREADS (1u << 18)
+
+/* Whether the kernel lets userspace spread a context's compute over sibling
+ * kernel queues and keep completion ordered: independent queues, cumulative
+ * output signals (a submission's outputs include the earlier points of a
+ * private timeline) and input syncs that every command of a submission
+ * waits on. A kernel that already spreads one queue's compute over firmware
+ * channels itself (COMPUTE_MULTI_CHANNEL) needs no siblings.
+ */
+static inline bool
+agx_sibling_compute_supported(const struct agx_device *dev)
+{
+   const uint64_t required = DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES |
+                             DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS |
+                             DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS;
+   return !dev->is_virtio && !(dev->debug & AGX_DBG_1QUEUE) &&
+          (dev->params.features & required) == required &&
+          !(dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL);
 }
 
 /*

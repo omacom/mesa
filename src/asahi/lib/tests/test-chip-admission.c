@@ -258,14 +258,14 @@ main(void)
 
    /* Implemented matrix paths are available without process flags. */
    const enum agx_chip matrix_chips[] = {
+      AGX_CHIP_G13G, AGX_CHIP_G13X, AGX_CHIP_G14G, AGX_CHIP_G14X,
       AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
       AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
    };
    for (unsigned i = 0; i < ARRAY_SIZE(matrix_chips); ++i)
       assert(agx_chip_cooperative_matrix_supported(matrix_chips[i]));
-   assert(!agx_chip_cooperative_matrix_supported(AGX_CHIP_G13G));
-   assert(!agx_chip_cooperative_matrix_supported(AGX_CHIP_G14X));
+   assert(!agx_chip_cooperative_matrix_supported(AGX_CHIP_G18G));
 
    /* The M5 Max (T6050, G17C) is admitted with its four clusters only, by
     * default and on the M5 bring-up path. */
@@ -319,6 +319,42 @@ main(void)
    bad.gpu_variant = 'S';
    assert(agx_chip_from_params(&bad) == AGX_CHIP_G17S);
    assert(!agx_params_m5_supported(&bad));
+
+   /* The M5 Ultra (T6050, G17D) is admitted with its two dies and eight
+    * clusters only. */
+   struct drm_asahi_params_global t6050d = g15_params('D', 0x6050, 8);
+   t6050d.gpu_generation = 17;
+   t6050d.gpu_hal_generation = DRM_ASAHI_GPU_HAL_300;
+   t6050d.num_dies = 2;
+   assert(agx_chip_from_params(&t6050d) == AGX_CHIP_G17D);
+   assert(agx_chip_g17_m5(AGX_CHIP_G17D));
+   assert(agx_params_m5_supported(&t6050d));
+   assert(!agx_params_driver_supported(&t6050d));
+
+   bad = t6050d;
+   bad.num_dies = 1;
+   assert(!agx_params_m5_supported(&bad));
+   bad = t6050d;
+   bad.num_clusters_total = 4;
+   assert(!agx_params_m5_supported(&bad));
+   bad = t6050d;
+   bad.chip_id = 0x6051;
+   assert(!agx_params_m5_supported(&bad));
+   bad = t6050d;
+   bad.gpu_hal_generation = DRM_ASAHI_GPU_HAL_200;
+   assert(!agx_params_m5_supported(&bad));
+
+   /* Two dies describe neither an M5 Pro nor an M5 Max. */
+   bad = t6050d;
+   bad.gpu_variant = 'C';
+   bad.num_clusters_total = 4;
+   assert(!agx_params_m5_supported(&bad));
+   bad.num_dies = 1;
+   assert(agx_params_m5_supported(&bad));
+
+   /* GL runs through zink on the M5 Ultra and on no other chip. */
+   for (unsigned c = 0; c <= AGX_CHIP_UNKNOWN; ++c)
+      assert(agx_chip_gl_through_zink(c) == (c == AGX_CHIP_G17D));
 
    /* The M5 (T8142, G17G) is admitted by its exact kernel identity. */
    struct drm_asahi_params_global m5 = {
@@ -380,6 +416,18 @@ main(void)
    assert(agx_params_native_kernel_abi_supported(&bad));
    bad = g15g;
    bad.features = (UINT64_C(1) << 3) | (UINT64_C(1) << 5);
+   assert(!agx_params_native_kernel_abi_supported(&bad));
+   /* The shared g16 backend on T8122: VM status and independent queues
+    * plus the native contract, no scheduled queues (J615 feature word). */
+   bad = g15g;
+   bad.features = UINT64_C(0x10260005c06);
+   assert(agx_params_native_kernel_abi_supported(&bad));
+   bad.features &= ~DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS;
+   assert(!agx_params_native_kernel_abi_supported(&bad));
+   bad.features = UINT64_C(0x10260005c06) &
+                  ~DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS;
+   assert(!agx_params_native_kernel_abi_supported(&bad));
+   bad.features = UINT64_C(0x10260005c06) & ~DRM_ASAHI_FEATURE_VM_STATUS;
    assert(!agx_params_native_kernel_abi_supported(&bad));
 
    bad = g15g;

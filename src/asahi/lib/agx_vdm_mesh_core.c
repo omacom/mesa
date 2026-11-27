@@ -8,7 +8,7 @@
 static bool
 supported(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17P;
+   return agx_chip_g17p_or_m5(chip);
 }
 bool
 agx_vdm_mesh_threadgroup_pack(const uint32_t size[3], uint32_t *word)
@@ -39,6 +39,18 @@ agx_vdm_m5_mesh_set_output_limits(struct agx_vdm_mesh_state_info *info,
    info->raw_prefix[0] = uvs_words | ((uvs_words + 1) << 8);
    info->raw_tail[1] = last_primitive | ((last_primitive >> 4) << 16);
    info->raw_tail[4] = 1 + aligned_vertices * uvs_words / 4;
+   return true;
+}
+
+bool
+agx_vdm_m5_mesh_set_task_payload(struct agx_vdm_mesh_state_info *info,
+                                 uint32_t payload_size_B)
+{
+   if (!info || payload_size_B > AGX_VDM_M5_MESH_MAX_TASK_PAYLOAD_BYTES)
+      return false;
+
+   info->raw_tail[0] =
+      payload_size_B ? (payload_size_B + 1023u) / 1024u : 1u;
    return true;
 }
 
