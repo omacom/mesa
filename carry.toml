@@ -12,10 +12,11 @@ repo = "https://github.com/omacom/mesa.git"
 
 [[carry]]
 pr = "aurora-silicon/mesa#415"
-commit = "eeb2f0ce4168e44eaebe355371e3b4bda4c25ee8"
+commit = "7bcef61a9f4dde71b061b74caf20bf5632c1fb93"
 why = "admit the measured 30-core T6034 G15C contract (M3 Max GPU)"
+note = "its branch merges aurora-wip a15657a362b0, so one commit of its net diff; not the bot's later c14283bf516d, which deletes AGENTS.md, CLAUDE.md and GEMINI.md"
 
 [[carry]]
 pr = "aurora-silicon/mesa#416"
-commit = "1be0ab79286d40aa82ddd49538107b4ef654ad5f"
-why = "Honeykrisp: restore the native G15S Vulkan capability profile"
+commit = "928572f9db84eb3703932cb7d1b0340135eccf03"
+why = "Borealis: restore the native G15 Vulkan capability profile"
