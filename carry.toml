@@ -20,3 +20,9 @@ note = "its branch merges aurora-wip a15657a362b0, so one commit of its net diff
 pr = "aurora-silicon/mesa#416"
 commit = "928572f9db84eb3703932cb7d1b0340135eccf03"
 why = "Borealis: restore the native G15 Vulkan capability profile"
+
+[[carry]]
+ours = "agx-keep-weak-ffma"
+commit = "e577389cd127c41560f38b6e9fe7056762b8390e"
+why = "OpenCL fp32 at full speed: since fe376944ae1 every mad() takes the FP32 FMA repair, so clpeak fp32 falls about 10x on M1 and M2"
+upstream = "aurora-silicon/mesa aurora-wip, as a fix to fe376944ae1 (aurora-silicon/mesa#930); PR not opened yet"
