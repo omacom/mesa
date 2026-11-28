@@ -9147,6 +9147,7 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
          return agx_fmul_to(b, dst, agx_g17p_coerce_f32_src(b, s0),
                             agx_g17p_coerce_f32_src(b, s1));
 
+   case nir_op_ffma_weak:
    case nir_op_ffma:
       if (instr->def.bit_size == 16)
          return agx_hfma_to(b, dst, agx_coerce_f16_src(b, s0),
@@ -17241,6 +17242,9 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
    if (post_lower && agx_nir_has_temp_vars(nir))
       post_lower = false;
 
+   /* After the driver's agx_nir_lower_fma_rte(). */
+   NIR_PASS(_, nir, agx_nir_lower_ffma_weak);
+
    if (shader_quad_control)
       agx_preserve_quad_control(nir);
 
@@ -19668,6 +19672,10 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
     * intrinsic. Keep the AGX2 compilation path unchanged. */
    if (key->dev.shader_quad_control)
       agx_preserve_quad_control(nir);
+
+   /* Lowering after preprocessing (interpolation, linked libagx) can still
+    * produce ffma_weak. */
+   NIR_PASS(_, nir, agx_nir_lower_ffma_weak);
 
    agx_compiler_debug = agx_get_compiler_debug();
    char *refusal = agx_refusal_buffer(false);

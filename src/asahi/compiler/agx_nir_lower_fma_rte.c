@@ -156,9 +156,10 @@ fma_tininess_before_rounding(enum agx_chip chip)
  * (VK_KHR_shader_fma) and OpenCL fma() reach NIR as ffma. GLSL.std.450 Fma
  * reaches it as ffma_weak, which may be evaluated unfused, and NIR fuses
  * contractable multiply-adds into ffma by itself; neither carries the contract
- * this repair keeps. nir_opt_algebraic rewrites ffma_weak into ffma, after
- * which the two cannot be told apart, so the driver runs this once, where a
- * shader enters it and before any algebraic optimization
+ * this repair keeps. agx_nir_options keeps 32-bit ffma_weak through
+ * nir_opt_algebraic, because a frontend may optimize before the driver sees
+ * the shader (Rusticl does), and agx_nir_lower_ffma_weak() lowers it once the
+ * repair has run. The driver runs this once, where a shader enters it
  * (hk_preprocess_nir_internal(), agx_shader_initialize()). The repair guards
  * the native ffma it keeps, so a second run would repair it again.
  */
@@ -168,4 +169,34 @@ agx_nir_lower_fma_rte(nir_shader *shader, enum agx_chip chip)
    if (!fma_tininess_before_rounding(chip) || !fma_rte_applies(shader))
       return false;
    return nir_shader_lower_instructions(shader, filter, lower, NULL);
+}
+
+/* What nir_opt_algebraic does to ffma_weak without
+ * nir_float_muladd_support_keep_weak_ffma: a contractable one is split so it
+ * can be optimized and fused again later, the others become ffma. */
+static bool
+lower_weak(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (alu->op != nir_op_ffma_weak || alu->def.bit_size != 32)
+      return false;
+
+   if (nir_alu_instr_no_contract(alu)) {
+      alu->op = nir_op_ffma;
+      return true;
+   }
+
+   b->cursor = nir_before_instr(&alu->instr);
+   b->fp_math_ctrl = alu->fp_math_ctrl;
+   nir_def *product = nir_fmul(b, nir_ssa_for_alu_src(b, alu, 0),
+                               nir_ssa_for_alu_src(b, alu, 1));
+   nir_def_replace(&alu->def,
+                   nir_fadd(b, product, nir_ssa_for_alu_src(b, alu, 2)));
+   return true;
+}
+
+bool
+agx_nir_lower_ffma_weak(nir_shader *shader)
+{
+   return nir_shader_alu_pass(shader, lower_weak, nir_metadata_control_flow,
+                              NULL);
 }

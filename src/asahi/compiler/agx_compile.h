@@ -893,7 +893,11 @@ agx_round_registers(unsigned halfregs)
 
 static const nir_shader_compiler_options agx_nir_options = {
    .float_mul_add16 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
-   .float_mul_add32 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
+   /* Frontends such as Rusticl run nir_opt_algebraic before the driver's
+    * explicit-RTE FMA repair. ffma_weak (OpenCL mad(), GLSL fma()) must reach
+    * that repair as ffma_weak; agx_nir_lower_ffma_weak() lowers it after. */
+   .float_mul_add32 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse |
+                      nir_float_muladd_support_keep_weak_ffma,
    .lower_flrp16 = true,
    .lower_flrp32 = true,
    .lower_flrp64 = true,

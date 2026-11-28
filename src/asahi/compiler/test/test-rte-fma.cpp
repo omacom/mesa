@@ -151,6 +151,45 @@ TEST(NativeFMA, RepairTakesOnlyStrictFMA)
    }
 }
 
+/* Rusticl runs nir_opt_algebraic before agx_shader_initialize(): OpenCL mad()
+ * must still reach the repair as ffma_weak and leave it unrepaired. */
+TEST(NativeFMA, MadSurvivesFrontendAlgebraic)
+{
+   for (enum agx_chip chip : {AGX_CHIP_G13G, AGX_CHIP_G17P}) {
+      SCOPED_TRACE(chip);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "OpenCL mad");
+      b.shader->info.float_controls_execution_mode =
+         FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP32 |
+         FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32;
+      nir_def *x = agx_test_load_preamble(&b, 1, 32, 4);
+      nir_def *y = agx_test_load_preamble(&b, 1, 32, 8);
+      nir_def *z = agx_test_load_preamble(&b, 1, 32, 12);
+      /* As vtn_opencl.c builds OpenclStd_Mad. */
+      b.fp_math_ctrl |= nir_fp_no_contract | nir_fp_no_transform;
+      nir_store_global(&b, nir_ffma_weak(&b, x, y, z), nir_imm_int64(&b, 0),
+                       .align_mul = 4);
+
+      NIR_PASS(_, b.shader, nir_opt_algebraic);
+      EXPECT_FALSE(agx_nir_lower_fma_rte(b.shader, chip));
+      EXPECT_TRUE(agx_nir_lower_ffma_weak(b.shader));
+      nir_validate_shader(b.shader, "OpenCL mad");
+
+      unsigned strict = 0, weak = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            strict += nir_instr_as_alu(instr)->op == nir_op_ffma;
+            weak += nir_instr_as_alu(instr)->op == nir_op_ffma_weak;
+         }
+      }
+      EXPECT_EQ(strict, 1u);
+      EXPECT_EQ(weak, 0u);
+      ralloc_free(b.shader);
+   }
+}
+
 struct fma_case {
    uint32_t a, c, z, native, expected;
 };
